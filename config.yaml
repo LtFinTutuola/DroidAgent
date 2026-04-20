@@ -1,6 +1,6 @@
 repo:
-  path: "../Core" # Ensure this points to the root of the Core repository
-  solution_path: "TCPOS.DroidPos/TCPOS.Droidpos.sln" # Relative to repo root
+  path: "C:/repo/8.1/core"
+  solution_path: "TCPOS.DroidPos/TCPOS.DroidPos.sln"
   target_branch: "release/8.1"
 
 llm:

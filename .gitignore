@@ -1,0 +1,7 @@
+venv/
+roslyn_tool/
+obj/
+bin/
+temp_code.cs
+output/
+log/

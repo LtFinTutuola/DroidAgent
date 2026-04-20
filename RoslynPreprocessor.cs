@@ -11,50 +11,70 @@ namespace RoslynPreprocessor
     {
         static void Main(string[] args)
         {
-            if (args.Length < 1) 
-            {
-                Console.WriteLine("Error: Missing input path");
-                return; 
-            }
-            string inputPath = args[0];
-            
-            string code;
-            try {
-                code = File.ReadAllText(inputPath);
-            } 
-            catch (Exception ex) {
-                Console.WriteLine($"Error reading {inputPath}: {ex.Message}");
-                return;
-            }
-
             var parseOptions = new CSharpParseOptions(
                 preprocessorSymbols: new[] { "ANDROID", "MonoDroid" },
                 languageVersion: LanguageVersion.Latest,
-                documentationMode: DocumentationMode.Parse // Keep XML doc comments
+                documentationMode: DocumentationMode.Parse
             );
-            
-            var tree = CSharpSyntaxTree.ParseText(code, parseOptions);
-            var root = tree.GetRoot();
-            
-            // Remove disabled #if blocks and directives
-            var triviaToRemove = root.DescendantTrivia().Where(t => 
-                t.IsKind(SyntaxKind.DisabledTextTrivia) ||
-                t.IsKind(SyntaxKind.IfDirectiveTrivia) ||
-                t.IsKind(SyntaxKind.ElifDirectiveTrivia) ||
-                t.IsKind(SyntaxKind.ElseDirectiveTrivia) ||
-                t.IsKind(SyntaxKind.EndIfDirectiveTrivia) ||
-                t.IsKind(SyntaxKind.RegionDirectiveTrivia) ||
-                t.IsKind(SyntaxKind.EndRegionDirectiveTrivia)
-            );
-            
-            root = root.ReplaceTrivia(triviaToRemove, (o, r) => default(SyntaxTrivia));
-
-            // Run rewriter to remove unapproved plugins/namespaces
             var rewriter = new CleanRewriter();
-            root = rewriter.Visit(root);
-            
-            // We print to Console, Python reads stdout
-            Console.WriteLine(root.ToFullString());
+
+            Console.InputEncoding = System.Text.Encoding.UTF8;
+            Console.OutputEncoding = System.Text.Encoding.UTF8;
+
+            // Sentinel used to mark end of input/output blocks
+            const string Sentinel = "===END_OF_CODE===";
+
+            while (true)
+            {
+                string line;
+                var codeBuffer = new System.Text.StringBuilder();
+                
+                // Read until sentinel or stream end
+                while ((line = Console.ReadLine()) != null)
+                {
+                    if (line == Sentinel) break;
+                    codeBuffer.AppendLine(line);
+                }
+
+                if (line == null && codeBuffer.Length == 0) break; // Finished
+
+                string code = codeBuffer.ToString();
+                if (string.IsNullOrWhiteSpace(code)) 
+                {
+                    Console.WriteLine(Sentinel);
+                    continue;
+                }
+
+                try
+                {
+                    var tree = CSharpSyntaxTree.ParseText(code, parseOptions);
+                    var root = tree.GetRoot();
+                    
+                    var triviaToRemove = root.DescendantTrivia().Where(t => 
+                        t.IsKind(SyntaxKind.DisabledTextTrivia) ||
+                        t.IsKind(SyntaxKind.IfDirectiveTrivia) ||
+                        t.IsKind(SyntaxKind.ElifDirectiveTrivia) ||
+                        t.IsKind(SyntaxKind.ElseDirectiveTrivia) ||
+                        t.IsKind(SyntaxKind.EndIfDirectiveTrivia) ||
+                        t.IsKind(SyntaxKind.RegionDirectiveTrivia) ||
+                        t.IsKind(SyntaxKind.EndRegionDirectiveTrivia)
+                    );
+                    
+                    root = root.ReplaceTrivia(triviaToRemove, (o, r) => default(SyntaxTrivia));
+                    root = rewriter.Visit(root);
+                    
+                    Console.WriteLine(root.ToFullString());
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"Error processing code: {ex.Message}");
+                }
+                finally
+                {
+                    // Always send sentinel back so Python knows we are done with this file
+                    Console.WriteLine(Sentinel);
+                }
+            }
         }
     }
     
