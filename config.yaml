@@ -1,0 +1,15 @@
+repo:
+  path: "../Core" # Ensure this points to the root of the Core repository
+  solution_path: "TCPOS.DroidPos/TCPOS.Droidpos.sln" # Relative to repo root
+  target_branch: "release/8.1"
+
+llm:
+  provider: "local_huggingface"
+  model_name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+  device: "auto" # or "cuda", "cpu"
+  quantization: "4bit" 
+  chunker:
+    max_chunk_size: 4000 
+
+output:
+  file_path: "./output/dataset.json"
