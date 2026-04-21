@@ -57,9 +57,19 @@ class RoslynServer:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            encoding="utf-8", # Force UTF-8 to handle BOMs and special chars
+            encoding="utf-8", 
             bufsize=1
         )
+        # Wait for "READY"
+        while True:
+            line = self.process.stdout.readline()
+            if not line:
+                err = self.process.stderr.read()
+                logger.error(f"Roslyn Server failed to start. Stderr: {err}")
+                break
+            if "READY" in line:
+                logger.info("Roslyn Server is READY.")
+                break
 
     def clean_code(self, code: str) -> str:
         with self.lock:
@@ -88,7 +98,16 @@ class RoslynServer:
                         return "\n".join(output)
                     
                     # If we got here without sentinel, something went wrong
-                    logger.warning(f"Roslyn Server didn't return sentinel. Output so far: {len(output)} lines")
+                    logger.warning(f"Roslyn Server didn't return sentinel. Output so far: {len(output)} lines. Sample: {output[:3]}")
+                    stderr = ""
+                    try:
+                        import fcntl
+                        import os
+                        # This works only on Unix-like, but we are on Windows...
+                        # On Windows we can't easily do non-blocking read without a thread
+                        pass 
+                    except: pass
+                    
                     self.stop()
                 except (BrokenPipeError, ConnectionResetError) as e:
                     logger.error(f"Roslyn Server connection lost: {e}. Attempting restart...")
@@ -210,22 +229,47 @@ class AgentState(TypedDict):
     valid_project_dirs: List[str]
     pull_requests: List[Dict] # Hierarchical: [{title, date, author, commits_list: []}]
 
-def execute_git(cmd: str, cwd: str = REPO_PATH) -> str:
+def execute_git(cmd: str, cwd: str = REPO_PATH, check=True) -> str:
     logger.info(f"Executing Git: {cmd}")
     try:
-        res = subprocess.run(cmd, cwd=cwd, shell=True, text=True, capture_output=True, check=True)
+        res = subprocess.run(cmd, cwd=cwd, shell=True, text=True, capture_output=True, check=check)
         return res.stdout.strip() if res.stdout else ""
     except subprocess.CalledProcessError as e:
         logger.error(f"Git command failed: {cmd} - {e.stderr}")
+        if check:
+            raise
         return ""
 
 def node_context_manager(state: AgentState):
     logger.info("--- NODE 1: Git Context Manager ---")
     logger.info(f"Targeting Repository: {REPO_PATH}")
-    execute_git("git fetch origin")
+    
+    # Cleanup any stale locks
+    lock_file = os.path.join(REPO_PATH, ".git", "index.lock")
+    if os.path.exists(lock_file):
+        logger.info("Removing stale git index lock...")
+        try: os.remove(lock_file)
+        except: pass
+    
+    # Check for uncommitted changes and stash them
+    status = execute_git("git status --porcelain", check=False)
+    if status:
+        logger.info("Local changes detected. Stashing...")
+        # Stash can fail if index is corrupted or locked, try to proceed anyway if possible
+        try:
+            execute_git("git stash", check=True)
+        except subprocess.CalledProcessError:
+            logger.warning("Git stash failed. Forcing reset instead...")
+    
+    # Enforce hard reset
+    execute_git("git reset --hard HEAD", check=True)
+    execute_git("git clean -fd", check=True)
+    
+    execute_git("git fetch origin", check=True)
     logger.info(f"Checking out branch: {BRANCH}")
-    execute_git(f"git checkout {BRANCH}")
-    execute_git(f"git pull origin {BRANCH}")
+    execute_git(f"git checkout {BRANCH}", check=True)
+    execute_git(f"git pull origin {BRANCH}", check=True)
+    
     logger.info("Context Manager Finished.")
     return state
 
@@ -259,8 +303,12 @@ def node_solution_mapper(state: AgentState):
     return {"valid_project_dirs": valid_dirs}
 
 def is_valid_file(filepath: str, valid_dirs: List[str]) -> bool:
-    if not filepath.endswith(".cs"): return False
-    if filepath.endswith(".designer.cs") or filepath.endswith(".resx") or ".g." in filepath: return False
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext not in [".cs", ".xaml", ".csproj"]: 
+        return False
+        
+    if filepath.endswith(".designer.cs") or filepath.endswith(".resx") or ".g." in filepath: 
+        return False
     
     # Check if the file is inside any of the valid project dirs
     filepath = filepath.replace("\\", "/")
@@ -308,16 +356,15 @@ def node_commit_filter(state: AgentState):
                 if not cHash: continue
                 changed_c_files = execute_git(f"git show --name-only --format=\"\" {cHash}").split("\n")
                 
-                # We process all files, but we flag if they belong to DroidPos solution
+                # Only process files that are in DroidPos and are valid types
                 files_to_process = []
                 for f in changed_c_files:
                     if not f: continue
-                    is_droidpos = is_valid_file(f, valid_dirs)
-                    files_to_process.append({"name": f, "is_in_droidpos": is_droidpos})
+                    if is_valid_file(f, valid_dirs):
+                        files_to_process.append({"name": f})
                 
                 if files_to_process:
-                    num_valid = sum(1 for f in files_to_process if f["is_in_droidpos"])
-                    logger.info(f"    Found {len(files_to_process)} files ({num_valid} in DroidPos) in commit {cHash[:8]}")
+                    logger.info(f"    Found {len(files_to_process)} relevant files in commit {cHash[:8]}")
                     commits_list.append({
                         "commit_hash": cHash,
                         "files_to_process": files_to_process
@@ -367,7 +414,6 @@ def process_commit(commit: Dict, tool_dir: str):
     
     for file_info in commit["files_to_process"]:
         f = file_info["name"]
-        is_droidpos = file_info["is_in_droidpos"]
         
         # Get file content and diff
         file_content = batcher.get_file_content(cHash, f)
@@ -377,13 +423,16 @@ def process_commit(commit: Dict, tool_dir: str):
         
         cleaned_text = file_content
         
-        # Only run roslyn if it's a valid C# file in the DroidPos solution space
-        if is_droidpos:
+        # Selective Routing
+        if f.endswith(".cs"):
             cleaned_text = server.clean_code(file_content)
+        elif f.endswith(".xaml") or f.endswith(".csproj"):
+            # Simple XML normalization: collapse multiple blank lines
+            import re
+            cleaned_text = re.sub(r'\n\s*\n', '\n\n', file_content).strip()
         
         files_data.append({
             "file_name": f,
-            "is_in_tcpos_droidpos": is_droidpos,
             "file_diffs": file_diffs,
             "text": cleaned_text
         })

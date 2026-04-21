@@ -24,6 +24,9 @@ namespace RoslynPreprocessor
             // Sentinel used to mark end of input/output blocks
             const string Sentinel = "===END_OF_CODE===";
 
+            // Notify Python that we are ready
+            Console.WriteLine("READY");
+
             while (true)
             {
                 string line;
@@ -50,6 +53,7 @@ namespace RoslynPreprocessor
                     var tree = CSharpSyntaxTree.ParseText(code, parseOptions);
                     var root = tree.GetRoot();
                     
+                    // 1. Remove all preprocessor directives and disabled code
                     var triviaToRemove = root.DescendantTrivia().Where(t => 
                         t.IsKind(SyntaxKind.DisabledTextTrivia) ||
                         t.IsKind(SyntaxKind.IfDirectiveTrivia) ||
@@ -57,16 +61,23 @@ namespace RoslynPreprocessor
                         t.IsKind(SyntaxKind.ElseDirectiveTrivia) ||
                         t.IsKind(SyntaxKind.EndIfDirectiveTrivia) ||
                         t.IsKind(SyntaxKind.RegionDirectiveTrivia) ||
-                        t.IsKind(SyntaxKind.EndRegionDirectiveTrivia)
+                        t.IsKind(SyntaxKind.EndRegionDirectiveTrivia) ||
+                        t.IsKind(SyntaxKind.DefineDirectiveTrivia) ||
+                        t.IsKind(SyntaxKind.UndefDirectiveTrivia)
                     );
                     
                     root = root.ReplaceTrivia(triviaToRemove, (o, r) => default(SyntaxTrivia));
+                    
+                    // 2. Perform semantic-like pruning with the Rewriter
                     root = rewriter.Visit(root);
                     
-                    Console.WriteLine(root.ToFullString());
+                    // 3. Normalize whitespace to fix formatting after deletions
+                    var finalCode = root.NormalizeWhitespace().ToFullString();
+                    Console.WriteLine(finalCode);
                 }
                 catch (Exception ex)
                 {
+                    Console.WriteLine($"Error processing code: {ex.Message}");
                     Console.Error.WriteLine($"Error processing code: {ex.Message}");
                 }
                 finally
@@ -80,15 +91,62 @@ namespace RoslynPreprocessor
     
     class CleanRewriter : CSharpSyntaxRewriter
     {
+        private bool IsDevExpress(string text)
+        {
+            return text != null && text.Contains("DevExpress");
+        }
+
         public override SyntaxNode VisitUsingDirective(UsingDirectiveSyntax node)
         {
+            if (node == null) return null;
             var name = node.Name.ToString();
-            // Drop external namespaces. Keep System, Microsoft, and TCPOS.
-            if (name.StartsWith("System") || name.StartsWith("Microsoft") || name.StartsWith("TCPOS"))
-            {
-                return base.VisitUsingDirective(node);
-            }
-            return null; // Remove this node completely
+            if (IsDevExpress(name)) return null;
+            return base.VisitUsingDirective(node);
+        }
+
+        public override SyntaxNode VisitFieldDeclaration(FieldDeclarationSyntax node)
+        {
+            if (node == null) return null;
+            if (node.Declaration != null && node.Declaration.Type != null && IsDevExpress(node.Declaration.Type.ToString())) return null;
+            return base.VisitFieldDeclaration(node);
+        }
+
+        public override SyntaxNode VisitPropertyDeclaration(PropertyDeclarationSyntax node)
+        {
+            if (node == null) return null;
+            if (node.Type != null && IsDevExpress(node.Type.ToString())) return null;
+            return base.VisitPropertyDeclaration(node);
+        }
+
+        public override SyntaxNode VisitMethodDeclaration(MethodDeclarationSyntax node)
+        {
+            if (node == null) return null;
+            // Prune methods that return DevExpress types or have DevExpress parameters
+            if (node.ReturnType != null && IsDevExpress(node.ReturnType.ToString())) return null;
+            if (node.ParameterList != null && node.ParameterList.Parameters.Any(p => p.Type != null && IsDevExpress(p.Type.ToString()))) return null;
+            
+            return base.VisitMethodDeclaration(node);
+        }
+
+        public override SyntaxNode VisitObjectCreationExpression(ObjectCreationExpressionSyntax node)
+        {
+            if (node == null) return null;
+            if (node.Type != null && IsDevExpress(node.Type.ToString())) return null;
+            return base.VisitObjectCreationExpression(node);
+        }
+
+        public override SyntaxNode VisitLocalDeclarationStatement(LocalDeclarationStatementSyntax node)
+        {
+            if (node == null) return null;
+            if (node.Declaration != null && node.Declaration.Type != null && IsDevExpress(node.Declaration.Type.ToString())) return null;
+            return base.VisitLocalDeclarationStatement(node);
+        }
+        
+        public override SyntaxNode VisitExpressionStatement(ExpressionStatementSyntax node)
+        {
+            if (node == null) return null;
+            if (node.Expression != null && IsDevExpress(node.Expression.ToString())) return null;
+            return base.VisitExpressionStatement(node);
         }
     }
 }
