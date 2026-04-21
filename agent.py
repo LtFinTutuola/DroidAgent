@@ -237,7 +237,7 @@ OUTPUT_FILE = os.path.join(out_dir, f"agent_run_{run_timestamp}.json")
 
 class AgentState(TypedDict):
     valid_project_dirs: List[str]
-    pull_requests: List[Dict] # Hierarchical: [{title, date, author, commits_list: []}]
+    pull_requests: List[Dict] # Hierarchical: [{pull_request_title, pull_request_description, commits_list: []}]
 
 def execute_git(cmd: str, cwd: str = REPO_PATH, check=True) -> str:
     logger.info(f"Executing Git: {cmd}")
@@ -332,7 +332,7 @@ def node_commit_filter(state: AgentState):
     valid_dirs = state["valid_project_dirs"]
     
     # Fetch a larger batch of PRs to ensure we can find 10 relevant ones
-    merges_out = execute_git(f"git log origin/{BRANCH} --merges --first-parent --pretty=format:\"%H|%an|%cI|%s\" -n 50")
+    merges_out = execute_git(f'git log origin/{BRANCH} --merges --first-parent --pretty=format:"%H|%s" -n 50')
     lines = merges_out.split("\n") if merges_out else []
     
     pull_requests = []
@@ -343,9 +343,14 @@ def node_commit_filter(state: AgentState):
             
         if not line: continue
         parts = line.split("|")
-        if len(parts) < 4: continue
+        if len(parts) < 2: continue
         
-        pr_hash, pr_author, pr_date, pr_title = parts[0], parts[1], parts[2], parts[3]
+        pr_hash, pr_title = parts[0], parts[1]
+        
+        pr_description_raw = execute_git(f"git show -s --format=%b {pr_hash}")
+        pr_description = pr_description_raw.strip() if pr_description_raw else "No description provided"
+        if not pr_description:
+            pr_description = "No description provided"
         
         parents_out = execute_git(f"git show -s --format=%P {pr_hash}")
         parents = parents_out.split()
@@ -383,8 +388,7 @@ def node_commit_filter(state: AgentState):
             if commits_list:
                 pull_requests.append({
                     "pull_request_title": pr_title,
-                    "pull_request_date": pr_date,
-                    "pull_request_author": pr_author,
+                    "pull_request_description": pr_description,
                     "commits_list": commits_list
                 })
 
