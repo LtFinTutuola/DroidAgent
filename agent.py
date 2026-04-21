@@ -220,6 +220,9 @@ BRANCH = config["repo"]["target_branch"]
 LLM_MODEL = config["llm"]["model_name"]
 API_KEY = config["llm"].get("api_key", "no-key-required")
 
+MAX_PRS = config["repo"]["max_prs"] if "max_prs" in config["repo"] else 10
+MAX_CHUNK_LENGTH = config["repo"]["max_chunk_length"] if "max_chunk_length" in config["repo"] else 4000
+
 # Global Git Batcher
 GIT_BATCHER = GitBatcher(REPO_PATH)
 
@@ -322,11 +325,14 @@ def is_valid_file(filepath: str, valid_dirs: List[str]) -> bool:
     if ext not in [".cs", ".xaml", ".csproj"]: 
         return False
         
-    if filepath.endswith(".designer.cs") or filepath.endswith(".resx") or ".g." in filepath: 
+    # Ignore designers, resources and generated files
+    filepath_lower = filepath.lower()
+    if filepath_lower.endswith(".designer.cs") or filepath_lower.endswith(".resx") or ".g." in filepath_lower: 
         return False
         
     # FIX 1: Aggressive Pruning of Test Projects
-    if ".Test/" in filepath or ".Tests/" in filepath or filepath.endswith("Test.cs") or filepath.endswith("Tests.cs"):
+    if ".test/" in filepath_lower or ".tests/" in filepath_lower or ".unittests/" in filepath_lower or \
+       filepath_lower.endswith("test.cs") or filepath_lower.endswith("tests.cs"):
         return False
     
     # Check if the file is inside any of the valid project dirs
@@ -404,7 +410,7 @@ def node_commit_filter(state: AgentState):
     pull_requests = []
 
     for line in lines:
-        if len(pull_requests) >= 10:
+        if len(pull_requests) >= MAX_PRS:
             break
             
         if not line: continue
@@ -563,6 +569,14 @@ def parse_unified_diff(diff_lines: List[str]) -> List[Dict[str, str]]:
         
     return [h for h in hunks if h["old_code"] or h["new_code"]]
 
+def minify_code(text: str) -> str:
+    if not text: return text
+    # Collapse multiple horizontal spaces/tabs
+    text = re.sub(r'[ \t]+', ' ', text)
+    # Remove leading spaces/indentation on every line
+    text = re.sub(r'(?m)^[ \t]+', '', text)
+    return text.strip()
+
 def process_commit(commit: Dict, tool_dir: str):
     cHash = commit["commit_hash"]
     commit["commit_description"] = execute_git(f"git show -s --format=%B {cHash}")
@@ -601,9 +615,23 @@ def process_commit(commit: Dict, tool_dir: str):
             file_hunks = []
             max_len = max(len(old_chunks), len(new_chunks))
             for i in range(max_len):
-                o = old_chunks[i] if i < len(old_chunks) else ""
-                n = new_chunks[i] if i < len(new_chunks) else ""
-                file_hunks.append({"old_code": o, "new_code": n})
+                o_dict = old_chunks[i] if i < len(old_chunks) else {"code": "", "comments": []}
+                n_dict = new_chunks[i] if i < len(new_chunks) else {"code": "", "comments": []}
+                
+                o_code = minify_code(o_dict.get("code", ""))
+                n_code = minify_code(n_dict.get("code", ""))
+                
+                # Context Window Protection
+                if len(o_code) > MAX_CHUNK_LENGTH or len(n_code) > MAX_CHUNK_LENGTH:
+                    logger.warning(f"Discarding chunk in {f} due to size limit. Old: {len(o_code)}, New: {len(n_code)}")
+                    continue
+                    
+                file_hunks.append({
+                    "old_code": o_code, 
+                    "old_comments": o_dict.get("comments", []),
+                    "new_code": n_code,
+                    "new_comments": n_dict.get("comments", [])
+                })
                 
             if file_hunks:
                 logger.info(f"Adding {f}: extracted {len(file_hunks)} semantic chunks")

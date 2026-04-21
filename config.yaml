@@ -2,6 +2,8 @@ repo:
   path: "C:/repo/8.1/core"
   solution_path: "TCPOS.DroidPos/TCPOS.DroidPos.sln"
   target_branch: "release/8.1"
+  max_prs: 50
+  max_chunk_length: 4000
 
 llm:
   provider: "local_huggingface"

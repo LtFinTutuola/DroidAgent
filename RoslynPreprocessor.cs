@@ -105,13 +105,51 @@ namespace RoslynPreprocessor
                             }
                         }
 
-                        // Order by location to maintain code flow. Deduplication is handled by HashSet<SyntaxNode> 
-                        // reference equality, which is perfect for a single SyntaxTree.
-                        var chunks = semanticNodes
+                        var finalNodes = new HashSet<SyntaxNode>();
+                        foreach (var n in semanticNodes)
+                        {
+                            if (n is ClassDeclarationSyntax classNode)
+                            {
+                                foreach (var member in classNode.Members)
+                                {
+                                    if (member is MethodDeclarationSyntax || 
+                                        member is PropertyDeclarationSyntax || 
+                                        member is ConstructorDeclarationSyntax)
+                                    {
+                                        finalNodes.Add(member);
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                finalNodes.Add(n);
+                            }
+                        }
 
-                            .OrderBy(n => n.SpanStart)
-                            .Select(n => n.NormalizeWhitespace().ToFullString())
-                            .ToList();
+                        var chunks = new System.Collections.Generic.List<object>();
+                        foreach (var n in finalNodes.OrderBy(x => x.SpanStart))
+                        {
+                            // Extract comments
+                            var extractedComments = n.DescendantTrivia(descendIntoTrivia: true)
+                                .Concat(n.GetLeadingTrivia())
+                                .Concat(n.GetTrailingTrivia())
+                                .Where(t => t.IsKind(SyntaxKind.SingleLineCommentTrivia) || 
+                                            t.IsKind(SyntaxKind.MultiLineCommentTrivia) || 
+                                            t.IsKind(SyntaxKind.SingleLineDocumentationCommentTrivia) ||
+                                            t.IsKind(SyntaxKind.MultiLineDocumentationCommentTrivia) ||
+                                            t.IsKind(SyntaxKind.DocumentationCommentExteriorTrivia))
+                                .Select(t => t.ToString().Trim())
+                                .Where(s => !string.IsNullOrWhiteSpace(s))
+                                .Distinct()
+                                .ToList();
+
+                            var cleanNodeCode = n.WithoutTrivia().NormalizeWhitespace().ToFullString();
+
+                            chunks.Add(new {
+                                code = cleanNodeCode,
+                                comments = extractedComments
+                            });
+                        }
 
                         Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(chunks));
                     }
