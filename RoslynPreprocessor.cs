@@ -29,17 +29,16 @@ namespace RoslynPreprocessor
 
             while (true)
             {
-                string line;
+                string commandLine = Console.ReadLine();
+                if (commandLine == null) break;
+
                 var codeBuffer = new System.Text.StringBuilder();
-                
-                // Read until sentinel or stream end
+                string line;
                 while ((line = Console.ReadLine()) != null)
                 {
                     if (line == Sentinel) break;
                     codeBuffer.AppendLine(line);
                 }
-
-                if (line == null && codeBuffer.Length == 0) break; // Finished
 
                 string code = codeBuffer.ToString();
                 if (string.IsNullOrWhiteSpace(code)) 
@@ -52,37 +51,78 @@ namespace RoslynPreprocessor
                 {
                     var tree = CSharpSyntaxTree.ParseText(code, parseOptions);
                     var root = tree.GetRoot();
-                    
-                    // 1. Remove all preprocessor directives and disabled code
-                    var triviaToRemove = root.DescendantTrivia().Where(t => 
-                        t.IsKind(SyntaxKind.DisabledTextTrivia) ||
-                        t.IsKind(SyntaxKind.IfDirectiveTrivia) ||
-                        t.IsKind(SyntaxKind.ElifDirectiveTrivia) ||
-                        t.IsKind(SyntaxKind.ElseDirectiveTrivia) ||
-                        t.IsKind(SyntaxKind.EndIfDirectiveTrivia) ||
-                        t.IsKind(SyntaxKind.RegionDirectiveTrivia) ||
-                        t.IsKind(SyntaxKind.EndRegionDirectiveTrivia) ||
-                        t.IsKind(SyntaxKind.DefineDirectiveTrivia) ||
-                        t.IsKind(SyntaxKind.UndefDirectiveTrivia)
-                    );
-                    
-                    root = root.ReplaceTrivia(triviaToRemove, (o, r) => default(SyntaxTrivia));
-                    
-                    // 2. Perform semantic-like pruning with the Rewriter
-                    root = rewriter.Visit(root);
-                    
-                    // 3. Normalize whitespace to fix formatting after deletions
-                    var finalCode = root.NormalizeWhitespace().ToFullString();
-                    Console.WriteLine(finalCode);
+
+                    if (commandLine.StartsWith("CLEAN"))
+                    {
+                        // 1. Remove all preprocessor directives and disabled code
+                        var triviaToRemove = root.DescendantTrivia().Where(t => 
+                            t.IsKind(SyntaxKind.DisabledTextTrivia) ||
+                            t.IsKind(SyntaxKind.IfDirectiveTrivia) ||
+                            t.IsKind(SyntaxKind.ElifDirectiveTrivia) ||
+                            t.IsKind(SyntaxKind.ElseDirectiveTrivia) ||
+                            t.IsKind(SyntaxKind.EndIfDirectiveTrivia) ||
+                            t.IsKind(SyntaxKind.RegionDirectiveTrivia) ||
+                            t.IsKind(SyntaxKind.EndRegionDirectiveTrivia) ||
+                            t.IsKind(SyntaxKind.DefineDirectiveTrivia) ||
+                            t.IsKind(SyntaxKind.UndefDirectiveTrivia)
+                        );
+                        
+                        root = root.ReplaceTrivia(triviaToRemove, (o, r) => default(SyntaxTrivia));
+                        
+                        // 2. Perform semantic-like pruning with the Rewriter
+                        root = rewriter.Visit(root);
+                        
+                        // 3. Normalize whitespace to fix formatting after deletions
+                        var finalCode = root.NormalizeWhitespace().ToFullString();
+                        Console.WriteLine(finalCode);
+                    }
+                    else if (commandLine.StartsWith("EXTRACT|"))
+                    {
+                        var lineParts = commandLine.Substring(8).Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                        var targetLines = lineParts.Select(int.Parse).ToList();
+                        var sourceText = tree.GetText();
+                        var semanticNodes = new HashSet<SyntaxNode>();
+
+                        foreach (var lineNum in targetLines)
+                        {
+                            // 1-based to 0-based
+                            if (lineNum <= 0 || lineNum > sourceText.Lines.Count) continue;
+                            var lineSpan = sourceText.Lines[lineNum - 1].Span;
+                            var node = root.FindNode(lineSpan);
+
+                            while (node != null && 
+                                   !(node is MethodDeclarationSyntax) && 
+                                   !(node is PropertyDeclarationSyntax) && 
+                                   !(node is ConstructorDeclarationSyntax) && 
+                                   !(node is ClassDeclarationSyntax))
+                            {
+                                node = node.Parent;
+                            }
+                            
+                            if (node != null)
+                            {
+                                semanticNodes.Add(node);
+                            }
+                        }
+
+                        // Order by location to maintain code flow. Deduplication is handled by HashSet<SyntaxNode> 
+                        // reference equality, which is perfect for a single SyntaxTree.
+                        var chunks = semanticNodes
+
+                            .OrderBy(n => n.SpanStart)
+                            .Select(n => n.NormalizeWhitespace().ToFullString())
+                            .ToList();
+
+                        Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(chunks));
+                    }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Error processing code: {ex.Message}");
-                    Console.Error.WriteLine($"Error processing code: {ex.Message}");
+                    Console.WriteLine($"Error processing [{commandLine}]: {ex.Message}");
+                    Console.Error.WriteLine($"Error processing [{commandLine}]: {ex.Message}");
                 }
                 finally
                 {
-                    // Always send sentinel back so Python knows we are done with this file
                     Console.WriteLine(Sentinel);
                 }
             }

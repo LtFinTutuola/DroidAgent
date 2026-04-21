@@ -5,7 +5,7 @@ import subprocess
 import logging
 import threading
 from datetime import datetime
-from typing import TypedDict, List, Dict, Set
+from typing import TypedDict, List, Dict, Set, Tuple
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from concurrent.futures import ThreadPoolExecutor
@@ -71,15 +71,15 @@ class RoslynServer:
                 logger.info("Roslyn Server is READY.")
                 break
 
-    def clean_code(self, code: str) -> str:
+    def _send_command(self, command: str, code: str) -> str:
         with self.lock:
             for attempt in range(2): # Try twice if pipe breaks
                 if not self.process or self.process.poll() is not None:
                     self.start()
                 
                 try:
-                    # Send code + sentinel
-                    # Ensure each code block ends with a newline so the sentinel is on its own line
+                    # Send command line then code + sentinel
+                    self.process.stdin.write(command + "\n")
                     self.process.stdin.write(code + "\n" + SENTINEL + "\n")
                     self.process.stdin.flush()
 
@@ -89,7 +89,7 @@ class RoslynServer:
                         line = self.process.stdout.readline()
                         if not line: 
                             if attempt == 0: break # Try restart
-                            return code
+                            return ""
                         line = line.strip("\r\n")
                         if line == SENTINEL: break
                         output.append(line)
@@ -97,25 +97,30 @@ class RoslynServer:
                     if line == SENTINEL:
                         return "\n".join(output)
                     
-                    # If we got here without sentinel, something went wrong
-                    logger.warning(f"Roslyn Server didn't return sentinel. Output so far: {len(output)} lines. Sample: {output[:3]}")
-                    stderr = ""
-                    try:
-                        import fcntl
-                        import os
-                        # This works only on Unix-like, but we are on Windows...
-                        # On Windows we can't easily do non-blocking read without a thread
-                        pass 
-                    except: pass
-                    
                     self.stop()
                 except (BrokenPipeError, ConnectionResetError) as e:
                     logger.error(f"Roslyn Server connection lost: {e}. Attempting restart...")
                     self.stop()
                 except Exception as e:
                     logger.error(f"Roslyn Server Error: {e}")
-                    return code
-            return code
+                    return ""
+            return ""
+
+    def clean_code(self, code: str) -> str:
+        return self._send_command("CLEAN", code)
+
+    def extract_semantic_nodes(self, code: str, line_numbers: List[int]) -> List[str]:
+        if not line_numbers:
+            return []
+        ln_str = ",".join(map(str, line_numbers))
+        res_json = self._send_command(f"EXTRACT|{ln_str}", code)
+        if not res_json:
+            return []
+        try:
+            return json.loads(res_json)
+        except Exception as e:
+            logger.error(f"Failed to parse semantic nodes JSON: {e}. Response: {res_json[:100]}")
+            return []
 
     def stop(self):
         if self.process:
@@ -481,6 +486,39 @@ def prepare_roslyn_tool():
         
     return os.path.join(tool_dir, "bin", "Release", "net8.0", "roslyn_tool.exe") # Windows exe name
 
+def get_changed_line_numbers(old_text: str, new_text: str) -> Tuple[List[int], List[int]]:
+    old_lines = []
+    new_lines = []
+    # Use n=0 to get only changed lines with no context
+    diff = list(difflib.unified_diff(
+        old_text.splitlines(),
+        new_text.splitlines(),
+        n=0, lineterm=''
+    ))
+    
+    curr_old = 0
+    curr_new = 0
+    
+    for line in diff:
+        if line.startswith('@@'):
+            m = re.match(r'@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@', line)
+            if m:
+                curr_old = int(m.group(1))
+                curr_new = int(m.group(3))
+        elif line.startswith('-'):
+            if curr_old > 0:
+                old_lines.append(curr_old)
+                curr_old += 1
+        elif line.startswith('+'):
+            if curr_new > 0:
+                new_lines.append(curr_new)
+                curr_new += 1
+        elif line.startswith(' '):
+            curr_old += 1
+            curr_new += 1
+            
+    return sorted(list(set(old_lines))), sorted(list(set(new_lines)))
+
 import difflib
 
 def parse_unified_diff(diff_lines: List[str]) -> List[Dict[str, str]]:
@@ -549,38 +587,52 @@ def process_commit(commit: Dict, tool_dir: str):
         clean_new_content = new_content
         
         if f.endswith(".cs"):
-            if old_content:
-                clean_old_content = server.clean_code(old_content)
-            if new_content:
-                clean_new_content = server.clean_code(new_content)
+            clean_old_content = server.clean_code(old_content) if old_content else ""
+            clean_new_content = server.clean_code(new_content) if new_content else ""
+            
+            if clean_old_content == clean_new_content:
+                continue
+                
+            old_lns, new_lns = get_changed_line_numbers(clean_old_content, clean_new_content)
+            
+            old_chunks = server.extract_semantic_nodes(clean_old_content, old_lns) if old_lns else []
+            new_chunks = server.extract_semantic_nodes(clean_new_content, new_lns) if new_lns else []
+            
+            file_hunks = []
+            max_len = max(len(old_chunks), len(new_chunks))
+            for i in range(max_len):
+                o = old_chunks[i] if i < len(old_chunks) else ""
+                n = new_chunks[i] if i < len(new_chunks) else ""
+                file_hunks.append({"old_code": o, "new_code": n})
+                
+            if file_hunks:
+                logger.info(f"Adding {f}: extracted {len(file_hunks)} semantic chunks")
+                files_data.append({
+                    "file_name": f,
+                    "file_diffs": file_hunks
+                })
         elif f.endswith(".xaml") or f.endswith(".csproj"):
             if old_content:
                 clean_old_content = re.sub(r'\n\s*\n', '\n\n', old_content).strip()
             if new_content:
                 clean_new_content = re.sub(r'\n\s*\n', '\n\n', new_content).strip()
-        
-        if clean_old_content == clean_new_content:
-            logger.info(f"Skipping {f}: clean_old_content == clean_new_content")
-            continue
+                
+            if clean_old_content == clean_new_content:
+                continue
+                
+            diff_lines = list(difflib.unified_diff(
+                clean_old_content.splitlines(), 
+                clean_new_content.splitlines(), 
+                n=5, lineterm=''
+            ))
             
-        diff_lines = list(difflib.unified_diff(
-            clean_old_content.splitlines(), 
-            clean_new_content.splitlines(), 
-            fromfile="old", 
-            tofile="new", 
-            lineterm=''
-        ))
-        
-        parsed_hunks = parse_unified_diff(diff_lines)
-        if not parsed_hunks:
-            logger.info(f"Skipping {f}: parsed_hunks is empty! Diff lines: {len(diff_lines)}")
-            continue
-            
-        logger.info(f"Adding {f}: found {len(parsed_hunks)} hunks")
-        files_data.append({
-            "file_name": f,
-            "file_diffs": parsed_hunks
-        })
+            parsed_hunks = parse_unified_diff(diff_lines)
+            if parsed_hunks:
+                logger.info(f"Adding {f}: found {len(parsed_hunks)} expanded context hunks")
+                files_data.append({
+                    "file_name": f,
+                    "file_diffs": parsed_hunks
+                })
     
     commit["files"] = files_data
     # Cleanup temporary list
