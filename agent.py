@@ -171,7 +171,17 @@ class GitBatcher:
                 
                 try:
                     size = int(parts[2])
-                    content = self.process.stdout.read(size)
+                    
+                    bytes_read = 0
+                    chunks = []
+                    while bytes_read < size:
+                        chunk = self.process.stdout.read(size - bytes_read)
+                        if not chunk: break
+                        chunks.append(chunk)
+                        bytes_read += len(chunk)
+                    
+                    content = b"".join(chunks)
+                    
                     # Thoroughly consume the trailing newline
                     terminator = self.process.stdout.read(1)
                     if terminator != b"\n":
@@ -404,6 +414,50 @@ def prepare_roslyn_tool():
         
     return os.path.join(tool_dir, "bin", "Release", "net8.0", "roslyn_tool.exe") # Windows exe name
 
+import difflib
+
+def parse_unified_diff(diff_lines: List[str]) -> List[Dict[str, str]]:
+    hunks = []
+    current_old = []
+    current_new = []
+    in_hunk = False
+    
+    for line in diff_lines:
+        if line.startswith('--- ') or line.startswith('+++ '):
+            continue
+        if line.startswith('@@ '):
+            if in_hunk:
+                hunks.append({
+                    "old_code": "\n".join(current_old).strip(),
+                    "new_code": "\n".join(current_new).strip()
+                })
+            in_hunk = True
+            current_old = []
+            current_new = []
+            continue
+            
+        if in_hunk:
+            if line.startswith('-'):
+                current_old.append(line[1:])
+            elif line.startswith('+'):
+                current_new.append(line[1:])
+            elif line.startswith(' '):
+                # context line
+                current_old.append(line[1:])
+                current_new.append(line[1:])
+            else:
+                if line == "":
+                    current_old.append("")
+                    current_new.append("")
+            
+    if in_hunk:
+        hunks.append({
+            "old_code": "\n".join(current_old).strip(),
+            "new_code": "\n".join(current_new).strip()
+        })
+        
+    return [h for h in hunks if h["old_code"] or h["new_code"]]
+
 def process_commit(commit: Dict, tool_dir: str):
     cHash = commit["commit_hash"]
     commit["commit_description"] = execute_git(f"git show -s --format=%B {cHash}")
@@ -412,29 +466,53 @@ def process_commit(commit: Dict, tool_dir: str):
     server = get_roslyn_server()
     batcher = get_git_batcher()
     
+    parent_hash = execute_git(f'git rev-parse "{cHash}~1"', check=False)
+    
+    import re
     for file_info in commit["files_to_process"]:
         f = file_info["name"]
         
-        # Get file content and diff
-        file_content = batcher.get_file_content(cHash, f)
-        file_diffs = execute_git(f"git show --format= --patch {cHash} -- {f}")
+        old_content = batcher.get_file_content(parent_hash, f) if parent_hash else ""
+        new_content = batcher.get_file_content(cHash, f)
         
-        if not file_content: continue
+        if not old_content and not new_content:
+            continue
+            
+        clean_old_content = old_content
+        clean_new_content = new_content
         
-        cleaned_text = file_content
-        
-        # Selective Routing
         if f.endswith(".cs"):
-            cleaned_text = server.clean_code(file_content)
+            if old_content:
+                clean_old_content = server.clean_code(old_content)
+            if new_content:
+                clean_new_content = server.clean_code(new_content)
         elif f.endswith(".xaml") or f.endswith(".csproj"):
-            # Simple XML normalization: collapse multiple blank lines
-            import re
-            cleaned_text = re.sub(r'\n\s*\n', '\n\n', file_content).strip()
+            if old_content:
+                clean_old_content = re.sub(r'\n\s*\n', '\n\n', old_content).strip()
+            if new_content:
+                clean_new_content = re.sub(r'\n\s*\n', '\n\n', new_content).strip()
         
+        if clean_old_content == clean_new_content:
+            logger.info(f"Skipping {f}: clean_old_content == clean_new_content")
+            continue
+            
+        diff_lines = list(difflib.unified_diff(
+            clean_old_content.splitlines(), 
+            clean_new_content.splitlines(), 
+            fromfile="old", 
+            tofile="new", 
+            lineterm=''
+        ))
+        
+        parsed_hunks = parse_unified_diff(diff_lines)
+        if not parsed_hunks:
+            logger.info(f"Skipping {f}: parsed_hunks is empty! Diff lines: {len(diff_lines)}")
+            continue
+            
+        logger.info(f"Adding {f}: found {len(parsed_hunks)} hunks")
         files_data.append({
             "file_name": f,
-            "file_diffs": file_diffs,
-            "text": cleaned_text
+            "file_diffs": parsed_hunks
         })
     
     commit["files"] = files_data
