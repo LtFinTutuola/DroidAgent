@@ -319,6 +319,10 @@ def is_valid_file(filepath: str, valid_dirs: List[str]) -> bool:
         
     if filepath.endswith(".designer.cs") or filepath.endswith(".resx") or ".g." in filepath: 
         return False
+        
+    # FIX 1: Aggressive Pruning of Test Projects
+    if ".Test/" in filepath or ".Tests/" in filepath or filepath.endswith("Test.cs") or filepath.endswith("Tests.cs"):
+        return False
     
     # Check if the file is inside any of the valid project dirs
     filepath = filepath.replace("\\", "/")
@@ -326,6 +330,63 @@ def is_valid_file(filepath: str, valid_dirs: List[str]) -> bool:
         if d in filepath:
             return True
     return False
+
+import re
+
+def resolve_pr_description(initial_description: str, current_commit_hash: str = "", max_depth: int = 3, visited: set = None) -> str:
+    if visited is None:
+        visited = set()
+    
+    if max_depth <= 0:
+        return initial_description
+        
+    pattern = re.compile(r'(?i)cher[ry]+[\s-]*pick(?:ed\s+from|\s+of)?\s*[#!]?\s*(\d+)')
+    m = pattern.search(initial_description)
+    
+    if m:
+        pr_id = m.group(1)
+        if pr_id in visited:
+            return initial_description
+        visited.add(pr_id)
+        
+        # Fetch multiple results — we need to semantically filter out backports
+        cmd = f'git log --all --grep="[#!]?{pr_id}\\b" -E --merges --format="===COMMIT===%H|||%b" -n 20'
+        log_output = execute_git(cmd, check=False)
+        fetched_description = ""
+        fetched_hash = ""
+        
+        if log_output:
+            current_description_normalized = initial_description.strip()
+            commits = [c for c in log_output.split('===COMMIT===') if c.strip()]
+            for commit_raw in commits:
+                parts = commit_raw.split('|||', 1)
+                if len(parts) == 2:
+                    found_hash = parts[0].strip()
+                    body = parts[1].strip()
+                    
+                    # Safety filter 1: skip the current PR itself (hash match)
+                    if found_hash == current_commit_hash.strip():
+                        continue
+                    
+                    # Safety filter 2: skip content-identical bodies (backport on another branch with same message)
+                    if body.strip() == current_description_normalized:
+                        continue
+                    
+                    # Semantic filter: skip any body that is itself a backport/cherry-pick
+                    # The TRUE original PR will not contain the words "cherry" in its body
+                    if 'cherry' in body.lower():
+                        continue
+                    
+                    # This is the true original PR
+                    fetched_hash = found_hash
+                    fetched_description = body
+                    break
+        
+        if fetched_description:
+            resolved_fetched = resolve_pr_description(fetched_description, fetched_hash, max_depth - 1, visited)
+            initial_description += f"\n\n--- Original PR [{pr_id}] Context ---\n{resolved_fetched}"
+            
+    return initial_description
 
 def node_commit_filter(state: AgentState):
     logger.info("--- NODE 3: History & Commit Filter ---")
@@ -351,6 +412,8 @@ def node_commit_filter(state: AgentState):
         pr_description = pr_description_raw.strip() if pr_description_raw else "No description provided"
         if not pr_description:
             pr_description = "No description provided"
+            
+        pr_description = resolve_pr_description(pr_description, pr_hash)
         
         parents_out = execute_git(f"git show -s --format=%P {pr_hash}")
         parents = parents_out.split()
