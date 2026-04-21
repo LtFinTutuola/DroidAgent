@@ -478,12 +478,22 @@ def node_json_exporter(state: AgentState):
     logger.info("--- NODE 6: JSON Exporter ---")
     pull_requests = state.get("pull_requests", [])
     
+    # Prune empty commits and empty PRs
+    valid_prs = []
+    for pr in pull_requests:
+        valid_commits = [c for c in pr.get("commits_list", []) if len(c.get("files", [])) > 0]
+        if valid_commits:
+            pr["commits_list"] = valid_commits
+            valid_prs.append(pr)
+            
+    logger.info(f"Pruned empty commits and PRs. Valid PRs: {len(valid_prs)} (out of {len(pull_requests)})")
+    
     out_dir = os.path.dirname(OUTPUT_FILE)
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
         
     # Wrap in the requested structure
-    final_output = [{"pull_request": pr} for pr in pull_requests]
+    final_output = [{"pull_request": pr} for pr in valid_prs]
     
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(final_output, f, indent=4)
