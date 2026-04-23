@@ -96,17 +96,18 @@ namespace RoslynPreprocessor
 
         /// <summary>
         /// Finds the semantic node covering the given 1-based line and returns
-        /// its full text with all original comments/trivia preserved.
-        /// Returns empty string if no node found.
+        /// a JSON object {"signature":"...","block_code":"..."}.
+        /// Returns {"signature":"","block_code":""} if no node is found.
         /// </summary>
         private static string ExtractBlock(string code, int lineNum)
         {
-            if (string.IsNullOrWhiteSpace(code)) return "";
+            var empty = System.Text.Json.JsonSerializer.Serialize(new { signature = "", block_code = "" });
+            if (string.IsNullOrWhiteSpace(code)) return empty;
             var tree = CSharpSyntaxTree.ParseText(code);
             var root = tree.GetRoot();
             var text = tree.GetText();
 
-            if (lineNum <= 0 || lineNum > text.Lines.Count) return "";
+            if (lineNum <= 0 || lineNum > text.Lines.Count) return empty;
             var line = text.Lines[lineNum - 1];
 
             var node = root.FindNode(line.Span);
@@ -119,7 +120,7 @@ namespace RoslynPreprocessor
                 node = node.Parent;
             }
 
-            if (node == null) return "";
+            if (node == null) return empty;
 
             // If we landed on a class, pick the member that actually intersects the line
             if (node is ClassDeclarationSyntax cls)
@@ -129,13 +130,22 @@ namespace RoslynPreprocessor
                     if ((member is MethodDeclarationSyntax || member is PropertyDeclarationSyntax || member is ConstructorDeclarationSyntax)
                         && member.Span.IntersectsWith(line.Span))
                     {
-                        return member.NormalizeWhitespace().ToFullString();
+                        return System.Text.Json.JsonSerializer.Serialize(new {
+                            signature  = GetIdentity(member),
+                            block_code = member.NormalizeWhitespace().ToFullString()
+                        });
                     }
                 }
-                return node.NormalizeWhitespace().ToFullString();
+                return System.Text.Json.JsonSerializer.Serialize(new {
+                    signature  = GetIdentity(node),
+                    block_code = node.NormalizeWhitespace().ToFullString()
+                });
             }
 
-            return node.NormalizeWhitespace().ToFullString();
+            return System.Text.Json.JsonSerializer.Serialize(new {
+                signature  = GetIdentity(node),
+                block_code = node.NormalizeWhitespace().ToFullString()
+            });
         }
 
         static void Main(string[] args)

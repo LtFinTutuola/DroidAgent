@@ -119,10 +119,14 @@ class RoslynServer:
             logger.error(f"Failed to parse Roslyn JSON: {e}. Response: {res[:100]}...")
             return []
 
-    def extract_block(self, code: str, line_num: int) -> str:
-        """Extracts the semantic node (method/property/ctor) covering line_num from code."""
+    def extract_block(self, code: str, line_num: int) -> Dict:
+        """Extracts the semantic node covering line_num. Returns {signature, block_code}."""
         header = f"EXTRACT_BLOCK|||{line_num}"
-        return self._send_command(header, code)
+        res = self._send_command(header, code)
+        try:
+            return json.loads(res) if res else {"signature": "", "block_code": ""}
+        except Exception:
+            return {"signature": "", "block_code": res or ""}
 
     def stop(self):
         if self.process:
@@ -786,19 +790,28 @@ def disaggregate_commit_intent(commit: Dict) -> None:
         logger.error(f"Phase B failed for commit: {e}")
 
 
-# ── Phase C: Atomic Diff Splitting ─────────────────────────────────────────────
+# ── Phase C: Atomic Diff Splitting (4-Key Preservation) ───────────────────────
+_NO_CONTEXT_STRINGS = frozenset([
+    "[NO_CONTEXT]",
+    "[Summarization failed.]",
+    "[Could not extract a semantic block at this location.]",
+    "No code content available for summarization.",
+])
+
 def split_large_diffs(file_obj: Dict) -> None:
+    server = get_roslyn_server()
     expanded = []
+    is_cs = file_obj.get("file_name", "").endswith(".cs")
     for diff in file_obj.get("file_diffs", []):
         total_len = len(diff.get("raw_old_code", "")) + len(diff.get("raw_new_code", ""))
         if total_len > MAX_CHUNK_LENGTH:
             prompt = (
                 "<Role>Git & Code Review Expert</Role>\n"
-                "<Task>Split the provided large unified diff into smaller, logically atomic sub-diffs based on independent functional changes.</Task>\n"
+                "<Task>Split the provided large diff into smaller, logically atomic sub-diffs based on independent functional changes.</Task>\n"
                 "<Constraints>\n"
                 "1. Each sub-diff must represent a standalone logical change.\n"
-                "2. Do not alter, omit, or hallucinate code content; strictly segment the existing diff.\n"
-                '3. Output STRICTLY as a JSON object without markdown wrapping: {"sub_diffs": [{"old_code": "...", "new_code": "..."}]}\n'
+                "2. Do NOT alter, omit, or hallucinate code content; strictly segment the existing code.\n"
+                '3. Output STRICTLY as a JSON object without markdown wrapping: {"sub_diffs": [{"raw_old_code": "...", "raw_new_code": "..."}]}\n'
                 "</Constraints>\n"
                 f"<InputDiff>\nOld Code: {diff.get('raw_old_code','')}\nNew Code: {diff.get('raw_new_code','')}\n</InputDiff>"
             )
@@ -812,11 +825,19 @@ def split_large_diffs(file_obj: Dict) -> None:
                 sub_diffs = parsed.get("sub_diffs", [])
                 if sub_diffs:
                     for sd in sub_diffs:
+                        raw_old = sd.get("raw_old_code", "")
+                        raw_new = sd.get("raw_new_code", "")
+                        # Deterministic clean-track via Roslyn (only for C# files)
+                        if is_cs:
+                            clean_old = server.clean_code(raw_old) if raw_old else ""
+                            clean_new = server.clean_code(raw_new) if raw_new else ""
+                        else:
+                            clean_old, clean_new = raw_old, raw_new
                         expanded.append({
-                            "raw_old_code":   sd.get("old_code", ""),
-                            "clean_old_code": sd.get("old_code", ""),
-                            "raw_new_code":   sd.get("new_code", ""),
-                            "clean_new_code": sd.get("new_code", ""),
+                            "raw_old_code":   raw_old,
+                            "clean_old_code": clean_old,
+                            "raw_new_code":   raw_new,
+                            "clean_new_code": clean_new,
                         })
                     continue  # original diff replaced by sub-diffs
             except Exception as e:
@@ -825,71 +846,167 @@ def split_large_diffs(file_obj: Dict) -> None:
     file_obj["file_diffs"] = expanded
 
 
-# ── Phase A: Per-diff Context Summarization ─────────────────────────────────────
+# ── Phase A: Per-diff Context Summarization (Dual-Track) ──────────────────────
+_NO_CONTEXT_REPLY = "[NO_CONTEXT]"
+
+def _xml_extract_parent_block(xml_text: str, search_text: str) -> str:
+    """Find the enclosing XML/XAML element that contains search_text using simple tag walking."""
+    if not search_text or not xml_text:
+        return ""
+    idx = xml_text.find(search_text)
+    if idx == -1:
+        # Try the first non-whitespace line of search_text
+        first = next((ln.strip() for ln in search_text.splitlines() if ln.strip()), "")
+        idx = xml_text.find(first)
+    if idx == -1:
+        return xml_text[:2000]  # fallback: first 2000 chars
+
+    # Walk backwards to find the opening tag of the enclosing element
+    start = xml_text.rfind('<', 0, idx)
+    while start > 0 and xml_text[start + 1] in ('!', '?', '/'):
+        start = xml_text.rfind('<', 0, start)
+
+    if start == -1:
+        return xml_text[:2000]
+
+    # Tag name
+    tag_end = start + 1
+    while tag_end < len(xml_text) and xml_text[tag_end] not in (' ', '\t', '\n', '\r', '>'):
+        tag_end += 1
+    tag_name = xml_text[start + 1:tag_end]
+    if not tag_name:
+        return xml_text[:2000]
+
+    # Find the matching closing tag
+    close_tag = f"</{tag_name}>"
+    end = xml_text.find(close_tag, idx)
+    if end == -1:
+        end = min(start + 3000, len(xml_text))
+    else:
+        end += len(close_tag)
+
+    return xml_text[start:end]
+
+
+def _build_context_prompt(file_name: str, block: str) -> str:
+    """Route to the correct specialised prompt based on file extension."""
+    no_ctx_instruction = (
+        "If the provided code block is purely whitespace formatting, entirely empty, "
+        "or lacks any meaningful functional/UI logic to describe, "
+        'you MUST reply with exactly the string: [NO_CONTEXT]\n'
+    )
+    if file_name.endswith(".csproj"):
+        return (
+            "<Role>.NET Architect</Role>\n"
+            "<Task>Analyze this .csproj project configuration block. Describe the architectural impact "
+            "(e.g., added NuGet dependency, target framework change, project reference).</Task>\n"
+            "<Constraints>\n"
+            "1. Maximum 2-3 sentences.\n"
+            "2. Focus on 'what changed' and 'why it matters architecturally'.\n"
+            "3. Do not include code snippets, markdown blocks, or conversational filler.\n"
+            f"4. {no_ctx_instruction}"
+            "5. Return only the plain text summary or [NO_CONTEXT].\n"
+            "</Constraints>\n"
+            f"<InputCode>\n{block}\n</InputCode>"
+        )
+    elif file_name.endswith(".xaml") and not file_name.endswith(".xaml.cs"):
+        return (
+            "<Role>UI/UX Developer</Role>\n"
+            "<Task>Analyze this XAML UI code block. Describe which part of the screen or visual component "
+            "is being defined or altered in this POS system.</Task>\n"
+            "<Constraints>\n"
+            "1. Maximum 2-3 sentences.\n"
+            "2. Focus on the visual/interaction purpose, not XML syntax.\n"
+            "3. Do not include code snippets, markdown blocks, or conversational filler.\n"
+            f"4. {no_ctx_instruction}"
+            "5. Return only the plain text summary or [NO_CONTEXT].\n"
+            "</Constraints>\n"
+            f"<InputCode>\n{block}\n</InputCode>"
+        )
+    else:  # .cs and .xaml.cs
+        return (
+            "<Role>Senior C# Software Engineer</Role>\n"
+            "<Task>Analyze the provided C# code block and summarize its core functional responsibility "
+            "within this POS system.</Task>\n"
+            "<Constraints>\n"
+            "1. Maximum 2-3 sentences.\n"
+            "2. Focus on 'what' it does and 'why', avoiding line-by-line descriptions.\n"
+            "3. Do not include code snippets, markdown blocks, or conversational filler.\n"
+            f"4. {no_ctx_instruction}"
+            "5. Return only the plain text summary or [NO_CONTEXT].\n"
+            "</Constraints>\n"
+            f"<InputCode>\n{block}\n</InputCode>"
+        )
+
+
 def enrich_file_diffs_with_context(file_obj: Dict, commit_hash: str) -> None:
     if not commit_hash:
         return
-    server  = get_roslyn_server()
-    batcher = get_git_batcher()
+    server    = get_roslyn_server()
+    batcher   = get_git_batcher()
     file_name = file_obj.get("file_name", "")
 
     # Fetch the current state of the file at this commit
     full_file = batcher.get_file_content(commit_hash, file_name)
     if not full_file:
-        # File was deleted — skip summarization
-        return
+        return  # File was deleted — skip summarization
+
+    is_cs   = file_name.endswith(".cs")          # includes .xaml.cs
+    is_xml  = file_name.endswith(".csproj") or (file_name.endswith(".xaml") and not is_cs)
 
     for diff in file_obj.get("file_diffs", []):
         raw_old = diff.get("raw_old_code", "")
         raw_new = diff.get("raw_new_code", "")
 
-        # Find a representative line number from new_code, fall back to old_code
         representative_code = raw_new if raw_new else raw_old
         if not representative_code:
-            diff["context_summarization"] = "No code content available for summarization."
+            diff["context_summarization"] = _NO_CONTEXT_REPLY
             continue
 
-        # Find the first non-empty line to locate a line number in the full file
-        first_line = next((ln.strip() for ln in representative_code.splitlines() if ln.strip()), "")
-        line_num = 1
-        if first_line:
-            for idx, file_line in enumerate(full_file.splitlines(), start=1):
-                if first_line in file_line:
-                    line_num = idx
-                    break
+        # ── Track 1: C# → Roslyn EXTRACT_BLOCK ────────────────────────────────
+        if is_cs:
+            # Find the first non-empty line to locate a line number in the full file
+            first_line = next((ln.strip() for ln in representative_code.splitlines() if ln.strip()), "")
+            line_num = 1
+            if first_line:
+                for idx, file_line in enumerate(full_file.splitlines(), start=1):
+                    if first_line in file_line:
+                        line_num = idx
+                        break
 
-        block = server.extract_block(full_file, line_num).strip()
+            result = server.extract_block(full_file, line_num)  # returns {signature, block_code}
+            signature  = result.get("signature", "")
+            block      = result.get("block_code", "").strip()
+            cache_key  = f"{file_name}::{signature}" if signature else f"{file_name}::line{line_num}"
 
-        # Token-saving short-circuit
-        if block and block == raw_new.strip():
-            diff["context_summarization"] = "[Current code block is identical to new_code — no broader context available.]"
+            # Token-saving short-circuit
+            if block and block == raw_new.strip():
+                diff["context_summarization"] = "[Current code block is identical to new_code — no broader context available.]"
+                continue
+            if block and block == raw_old.strip():
+                diff["context_summarization"] = "[Current code block is identical to old_code — change may have been reverted.]"
+                continue
+            if not block:
+                diff["context_summarization"] = _NO_CONTEXT_REPLY
+                continue
+
+        # ── Track 2: XML/XAML → Python parent-node extraction ─────────────────
+        elif is_xml:
+            block     = _xml_extract_parent_block(full_file, representative_code)
+            cache_key = f"{file_name}::{block[:80].strip()}"
+            if not block.strip():
+                diff["context_summarization"] = _NO_CONTEXT_REPLY
+                continue
+
+        else:
+            diff["context_summarization"] = _NO_CONTEXT_REPLY
             continue
-        if block and block == raw_old.strip():
-            diff["context_summarization"] = "[Current code block is identical to old_code — change may have been reverted or file deleted.]"
-            continue
 
-        if not block:
-            diff["context_summarization"] = "[Could not extract a semantic block at this location.]"
-            continue
-
-        # Cache key: file + first line of block
-        first_block_line = next((ln.strip() for ln in block.splitlines() if ln.strip()), block[:80])
-        cache_key = f"{file_name}::{first_block_line}"
-
+        # ── Cache lookup / LLM call ────────────────────────────────────────────
         if cache_key in CONTEXT_CACHE:
             diff["context_summarization"] = CONTEXT_CACHE[cache_key]
         else:
-            prompt = (
-                "<Role>Senior C# Software Engineer</Role>\n"
-                "<Task>Analyze the provided C# code block and summarize its core functional responsibility within the system.</Task>\n"
-                "<Constraints>\n"
-                "1. Maximum 2-3 sentences.\n"
-                "2. Focus on 'what' it does and 'why', avoiding line-by-line descriptions.\n"
-                "3. Do not include code snippets, markdown blocks, or conversational filler.\n"
-                "4. Return only the plain text summary.\n"
-                "</Constraints>\n"
-                f"<InputCode>\n{block}\n</InputCode>"
-            )
+            prompt = _build_context_prompt(file_name, block)
             try:
                 resp = get_openai_client().chat.completions.create(
                     model=LLM_MODEL,
@@ -942,33 +1059,51 @@ def node_llm_chunker(state: AgentState):
 def node_json_exporter(state: AgentState):
     logger.info("--- NODE 6: JSON Exporter ---")
     commits = state.get("commits", [])
-    
+
+    # ── Prune [NO_CONTEXT] diffs and empty files ───────────────────────────────
+    pruned_diff_count  = 0
+    pruned_file_count  = 0
+    for commit in commits:
+        valid_files = []
+        for file_obj in commit.get("files", []):
+            valid_diffs = [
+                d for d in file_obj.get("file_diffs", [])
+                if d.get("context_summarization", "") not in _NO_CONTEXT_STRINGS
+            ]
+            pruned_diff_count += len(file_obj.get("file_diffs", [])) - len(valid_diffs)
+            if valid_diffs:
+                file_obj["file_diffs"] = valid_diffs
+                valid_files.append(file_obj)
+            else:
+                pruned_file_count += 1
+        commit["files"] = valid_files
+
+    logger.info(f"Pruned {pruned_diff_count} [NO_CONTEXT] diffs and {pruned_file_count} empty files.")
+
     # Prune empty commits
-    valid_commits = [c for c in commits if len(c.get("files", [])) > 0]
-            
-    logger.info(f"Pruned empty commits. Valid commits: {len(valid_commits)} (out of {len(commits)})")
-    
+    valid_commits = [c for c in commits if c.get("files")]
+    logger.info(f"Valid commits after pruning: {len(valid_commits)} (out of {len(commits)})")
+
     out_dir = os.path.dirname(OUTPUT_FILE)
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
-        
-    # Wrap in the requested structure; strip internal helper fields
+
+    # Strip internal helper fields before export
     def _clean_commit(c: Dict) -> Dict:
-        out = {k: v for k, v in c.items() if k != "commit_hash_ref"}
-        return out
+        return {k: v for k, v in c.items() if k != "commit_hash_ref"}
 
     final_output = [{"commit": _clean_commit(c)} for c in valid_commits]
-    
+
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(final_output, f, indent=4)
         logger.info(f"Exported {len(final_output)} Commits to {OUTPUT_FILE}")
-    
+
     # Shutdown helpers
     if ROSLYN_SERVER:
         ROSLYN_SERVER.stop()
     if GIT_BATCHER:
         GIT_BATCHER.stop()
-        
+
     return state
 
 # ---- BUILD LANGGRAPH PIPELINE ----
