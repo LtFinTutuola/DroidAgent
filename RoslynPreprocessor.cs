@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Text;
+using System.Collections.Generic;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -9,222 +11,214 @@ namespace RoslynPreprocessor
 {
     class Program
     {
+        const string Sentinel = "===END_OF_CODE===";
+
+        private static string GetIdentity(SyntaxNode node)
+        {
+            if (node is MethodDeclarationSyntax m) 
+                return $"method:{m.Identifier.Text}({string.Join(",", m.ParameterList.Parameters.Select(p => p.Type?.ToString()))})";
+            if (node is PropertyDeclarationSyntax p) 
+                return $"prop:{p.Identifier.Text}";
+            if (node is ConstructorDeclarationSyntax c) 
+                return $"ctor:({string.Join(",", c.ParameterList.Parameters.Select(p => p.Type?.ToString()))})";
+            return node.ToString();
+        }
+
+        private static List<SyntaxNode> GetSemanticNodes(string code, List<int> lines)
+        {
+            if (string.IsNullOrWhiteSpace(code)) return new List<SyntaxNode>();
+            var tree = CSharpSyntaxTree.ParseText(code);
+            var root = tree.GetRoot();
+            var semanticNodes = new HashSet<SyntaxNode>();
+
+            foreach (var lineNum in lines)
+            {
+                var text = tree.GetText();
+                if (lineNum <= 0 || lineNum > text.Lines.Count) continue;
+                var line = text.Lines[lineNum - 1];
+                var node = root.FindNode(line.Span);
+                while (node != null && 
+                       !(node is MethodDeclarationSyntax) && 
+                       !(node is PropertyDeclarationSyntax) && 
+                       !(node is ConstructorDeclarationSyntax) && 
+                       !(node is ClassDeclarationSyntax))
+                {
+                    node = node.Parent;
+                }
+                
+                if (node != null)
+                {
+                    if (node is ClassDeclarationSyntax classNode)
+                    {
+                        foreach (var member in classNode.Members)
+                        {
+                            if (member is MethodDeclarationSyntax || member is PropertyDeclarationSyntax || member is ConstructorDeclarationSyntax)
+                            {
+                                if (member.Span.IntersectsWith(line.Span))
+                                {
+                                    semanticNodes.Add(member);
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        semanticNodes.Add(node);
+                    }
+                }
+            }
+            return semanticNodes.OrderBy(n => n.SpanStart).ToList();
+        }
+
+        private static object CreateChunk(SyntaxNode n)
+        {
+            if (n == null) return new { raw_code = "", clean_code = "" };
+
+            var rawCode = n.NormalizeWhitespace().ToFullString();
+            var commentKinds = new HashSet<SyntaxKind>
+            {
+                SyntaxKind.SingleLineCommentTrivia,
+                SyntaxKind.MultiLineCommentTrivia,
+                SyntaxKind.SingleLineDocumentationCommentTrivia,
+                SyntaxKind.MultiLineDocumentationCommentTrivia,
+                SyntaxKind.DocumentationCommentExteriorTrivia,
+            };
+
+            var cleanNode = n.ReplaceTrivia(
+                n.DescendantTrivia(descendIntoTrivia: true)
+                    .Concat(n.GetLeadingTrivia())
+                    .Concat(n.GetTrailingTrivia())
+                    .Where(t => commentKinds.Contains(t.Kind())),
+                (original, _) => SyntaxFactory.ElasticMarker
+            );
+            var cleanCode = cleanNode.NormalizeWhitespace().ToFullString();
+
+            return new { raw_code = rawCode, clean_code = cleanCode };
+        }
+
         static void Main(string[] args)
         {
-            var parseOptions = new CSharpParseOptions(
-                preprocessorSymbols: new[] { "ANDROID", "MonoDroid" },
-                languageVersion: LanguageVersion.Latest,
-                documentationMode: DocumentationMode.Parse
-            );
-            var rewriter = new CleanRewriter();
+            Console.InputEncoding = Encoding.UTF8;
+            Console.OutputEncoding = Encoding.UTF8;
 
-            Console.InputEncoding = System.Text.Encoding.UTF8;
-            Console.OutputEncoding = System.Text.Encoding.UTF8;
-
-            // Sentinel used to mark end of input/output blocks
-            const string Sentinel = "===END_OF_CODE===";
-
-            // Notify Python that we are ready
             Console.WriteLine("READY");
 
             while (true)
             {
                 string commandLine = Console.ReadLine();
-                if (commandLine == null) break;
-
-                var codeBuffer = new System.Text.StringBuilder();
-                string line;
-                while ((line = Console.ReadLine()) != null)
-                {
-                    if (line == Sentinel) break;
-                    codeBuffer.AppendLine(line);
-                }
-
-                string code = codeBuffer.ToString();
-                if (string.IsNullOrWhiteSpace(code)) 
-                {
-                    Console.WriteLine(Sentinel);
-                    continue;
-                }
+                if (commandLine == null || commandLine == "EXIT") break;
 
                 try
                 {
-                    var tree = CSharpSyntaxTree.ParseText(code, parseOptions);
-                    var root = tree.GetRoot();
-
-                    if (commandLine.StartsWith("CLEAN"))
+                    if (commandLine.StartsWith("CLEAN|||"))
                     {
-                        // 1. Remove all preprocessor directives and disabled code
-                        var triviaToRemove = root.DescendantTrivia().Where(t => 
-                            t.IsKind(SyntaxKind.DisabledTextTrivia) ||
-                            t.IsKind(SyntaxKind.IfDirectiveTrivia) ||
-                            t.IsKind(SyntaxKind.ElifDirectiveTrivia) ||
-                            t.IsKind(SyntaxKind.ElseDirectiveTrivia) ||
-                            t.IsKind(SyntaxKind.EndIfDirectiveTrivia) ||
-                            t.IsKind(SyntaxKind.RegionDirectiveTrivia) ||
-                            t.IsKind(SyntaxKind.EndRegionDirectiveTrivia) ||
-                            t.IsKind(SyntaxKind.DefineDirectiveTrivia) ||
-                            t.IsKind(SyntaxKind.UndefDirectiveTrivia)
-                        );
-                        
-                        root = root.ReplaceTrivia(triviaToRemove, (o, r) => default(SyntaxTrivia));
-                        
-                        // 2. Perform semantic-like pruning with the Rewriter
-                        root = rewriter.Visit(root);
-                        
-                        // 3. Normalize whitespace to fix formatting after deletions
-                        var finalCode = root.NormalizeWhitespace().ToFullString();
-                        Console.WriteLine(finalCode);
-                    }
-                    else if (commandLine.StartsWith("EXTRACT|"))
-                    {
-                        var lineParts = commandLine.Substring(8).Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-                        var targetLines = lineParts.Select(int.Parse).ToList();
-                        var sourceText = tree.GetText();
-                        var semanticNodes = new HashSet<SyntaxNode>();
-
-                        foreach (var lineNum in targetLines)
+                        var codeBuilder = new StringBuilder();
+                        while (true)
                         {
-                            // 1-based to 0-based
-                            if (lineNum <= 0 || lineNum > sourceText.Lines.Count) continue;
-                            var lineSpan = sourceText.Lines[lineNum - 1].Span;
-                            var node = root.FindNode(lineSpan);
-
-                            while (node != null && 
-                                   !(node is MethodDeclarationSyntax) && 
-                                   !(node is PropertyDeclarationSyntax) && 
-                                   !(node is ConstructorDeclarationSyntax) && 
-                                   !(node is ClassDeclarationSyntax))
-                            {
-                                node = node.Parent;
-                            }
-                            
-                            if (node != null)
-                            {
-                                semanticNodes.Add(node);
-                            }
+                            var line = Console.ReadLine();
+                            if (line == null || line == Sentinel) break;
+                            codeBuilder.AppendLine(line);
                         }
-
-                        var finalNodes = new HashSet<SyntaxNode>();
-                        foreach (var n in semanticNodes)
-                        {
-                            if (n is ClassDeclarationSyntax classNode)
-                            {
-                                foreach (var member in classNode.Members)
-                                {
-                                    if (member is MethodDeclarationSyntax || 
-                                        member is PropertyDeclarationSyntax || 
-                                        member is ConstructorDeclarationSyntax)
-                                    {
-                                        finalNodes.Add(member);
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                finalNodes.Add(n);
-                            }
-                        }
-
-                        var chunks = new System.Collections.Generic.List<object>();
-                        foreach (var n in finalNodes.OrderBy(x => x.SpanStart))
-                        {
-                            // Extract comments
-                            var extractedComments = n.DescendantTrivia(descendIntoTrivia: true)
-                                .Concat(n.GetLeadingTrivia())
-                                .Concat(n.GetTrailingTrivia())
+                        var code = codeBuilder.ToString();
+                        var tree = CSharpSyntaxTree.ParseText(code);
+                        var root = tree.GetRoot();
+                        var cleanRoot = root.ReplaceTrivia(
+                            root.DescendantTrivia(descendIntoTrivia: true)
                                 .Where(t => t.IsKind(SyntaxKind.SingleLineCommentTrivia) || 
                                             t.IsKind(SyntaxKind.MultiLineCommentTrivia) || 
                                             t.IsKind(SyntaxKind.SingleLineDocumentationCommentTrivia) ||
                                             t.IsKind(SyntaxKind.MultiLineDocumentationCommentTrivia) ||
-                                            t.IsKind(SyntaxKind.DocumentationCommentExteriorTrivia))
-                                .Select(t => t.ToString().Trim())
-                                .Where(s => !string.IsNullOrWhiteSpace(s))
-                                .Distinct()
-                                .ToList();
+                                            t.IsKind(SyntaxKind.DocumentationCommentExteriorTrivia)),
+                            (original, _) => SyntaxFactory.ElasticMarker
+                        );
+                        Console.WriteLine(cleanRoot.ToFullString());
+                    }
+                    else if (commandLine.StartsWith("DIFF_EXTRACT|||"))
+                    {
+                        var parts = commandLine.Split(new[] { "|||" }, StringSplitOptions.None);
+                        var oldLns = parts[1].Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).ToList();
+                        var newLns = parts[2].Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).ToList();
 
-                            var cleanNodeCode = n.WithoutTrivia().NormalizeWhitespace().ToFullString();
+                        var codeBuilder = new StringBuilder();
+                        while (true)
+                        {
+                            var line = Console.ReadLine();
+                            if (line == null || line == Sentinel) break;
+                            codeBuilder.AppendLine(line);
+                        }
 
-                            chunks.Add(new {
-                                code = cleanNodeCode,
-                                comments = extractedComments
+                        var combined = codeBuilder.ToString();
+                        var codeParts = combined.Split(new[] { "---DELIMITER---" }, StringSplitOptions.None);
+                        var oldCode = codeParts[0].Trim();
+                        var newCode = codeParts.Length > 1 ? codeParts[1].Trim() : "";
+
+                        var oldNodes = GetSemanticNodes(oldCode, oldLns);
+                        var newNodes = GetSemanticNodes(newCode, newLns);
+
+                        var oldTree = string.IsNullOrWhiteSpace(oldCode) ? null : CSharpSyntaxTree.ParseText(oldCode).GetRoot();
+                        var newTree = string.IsNullOrWhiteSpace(newCode) ? null : CSharpSyntaxTree.ParseText(newCode).GetRoot();
+
+                        var pairs = new List<object>();
+                        var processedNewIdentities = new HashSet<string>();
+
+                        foreach (var oldNode in oldNodes)
+                        {
+                            var identity = GetIdentity(oldNode);
+                            SyntaxNode newNode = null;
+                            if (newTree != null)
+                            {
+                                newNode = newTree.DescendantNodes()
+                                    .FirstOrDefault(n => (n is MethodDeclarationSyntax || n is PropertyDeclarationSyntax || n is ConstructorDeclarationSyntax) && GetIdentity(n) == identity);
+                            }
+
+                            if (newNode != null) processedNewIdentities.Add(identity);
+
+                            dynamic oldChunk = CreateChunk(oldNode);
+                            dynamic newChunk = CreateChunk(newNode);
+
+                            pairs.Add(new {
+                                raw_old_code = oldChunk.raw_code,
+                                clean_old_code = oldChunk.clean_code,
+                                raw_new_code = newChunk.raw_code,
+                                clean_new_code = newChunk.clean_code
                             });
                         }
 
-                        Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(chunks));
+                        foreach (var newNode in newNodes)
+                        {
+                            var identity = GetIdentity(newNode);
+                            if (processedNewIdentities.Contains(identity)) continue;
+
+                            SyntaxNode oldNode = null;
+                            if (oldTree != null)
+                            {
+                                oldNode = oldTree.DescendantNodes()
+                                    .FirstOrDefault(n => (n is MethodDeclarationSyntax || n is PropertyDeclarationSyntax || n is ConstructorDeclarationSyntax) && GetIdentity(n) == identity);
+                            }
+
+                            dynamic oldChunk = CreateChunk(oldNode);
+                            dynamic newChunk = CreateChunk(newNode);
+
+                            pairs.Add(new {
+                                raw_old_code = oldChunk.raw_code,
+                                clean_old_code = oldChunk.clean_code,
+                                raw_new_code = newChunk.raw_code,
+                                clean_new_code = newChunk.clean_code
+                            });
+                        }
+
+                        Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(pairs));
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Error processing [{commandLine}]: {ex.Message}");
-                    Console.Error.WriteLine($"Error processing [{commandLine}]: {ex.Message}");
+                    Console.Error.WriteLine($"Error: {ex.Message}\n{ex.StackTrace}");
                 }
                 finally
                 {
                     Console.WriteLine(Sentinel);
                 }
             }
-        }
-    }
-    
-    class CleanRewriter : CSharpSyntaxRewriter
-    {
-        private bool IsDevExpress(string text)
-        {
-            return text != null && text.Contains("DevExpress");
-        }
-
-        public override SyntaxNode VisitUsingDirective(UsingDirectiveSyntax node)
-        {
-            if (node == null) return null;
-            var name = node.Name.ToString();
-            if (IsDevExpress(name)) return null;
-            return base.VisitUsingDirective(node);
-        }
-
-        public override SyntaxNode VisitFieldDeclaration(FieldDeclarationSyntax node)
-        {
-            if (node == null) return null;
-            if (node.Declaration != null && node.Declaration.Type != null && IsDevExpress(node.Declaration.Type.ToString())) return null;
-            return base.VisitFieldDeclaration(node);
-        }
-
-        public override SyntaxNode VisitPropertyDeclaration(PropertyDeclarationSyntax node)
-        {
-            if (node == null) return null;
-            if (node.Type != null && IsDevExpress(node.Type.ToString())) return null;
-            return base.VisitPropertyDeclaration(node);
-        }
-
-        public override SyntaxNode VisitMethodDeclaration(MethodDeclarationSyntax node)
-        {
-            if (node == null) return null;
-            // Prune methods that return DevExpress types or have DevExpress parameters
-            if (node.ReturnType != null && IsDevExpress(node.ReturnType.ToString())) return null;
-            if (node.ParameterList != null && node.ParameterList.Parameters.Any(p => p.Type != null && IsDevExpress(p.Type.ToString()))) return null;
-            
-            return base.VisitMethodDeclaration(node);
-        }
-
-        public override SyntaxNode VisitObjectCreationExpression(ObjectCreationExpressionSyntax node)
-        {
-            if (node == null) return null;
-            if (node.Type != null && IsDevExpress(node.Type.ToString())) return null;
-            return base.VisitObjectCreationExpression(node);
-        }
-
-        public override SyntaxNode VisitLocalDeclarationStatement(LocalDeclarationStatementSyntax node)
-        {
-            if (node == null) return null;
-            if (node.Declaration != null && node.Declaration.Type != null && IsDevExpress(node.Declaration.Type.ToString())) return null;
-            return base.VisitLocalDeclarationStatement(node);
-        }
-        
-        public override SyntaxNode VisitExpressionStatement(ExpressionStatementSyntax node)
-        {
-            if (node == null) return null;
-            if (node.Expression != null && IsDevExpress(node.Expression.ToString())) return null;
-            return base.VisitExpressionStatement(node);
         }
     }
 }

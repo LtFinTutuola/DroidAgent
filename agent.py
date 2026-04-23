@@ -107,19 +107,20 @@ class RoslynServer:
             return ""
 
     def clean_code(self, code: str) -> str:
-        return self._send_command("CLEAN", code)
+        return self._send_command("CLEAN|||", code)
 
-    def extract_semantic_nodes(self, code: str, line_numbers: List[int]) -> List[str]:
-        if not line_numbers:
-            return []
-        ln_str = ",".join(map(str, line_numbers))
-        res_json = self._send_command(f"EXTRACT|{ln_str}", code)
-        if not res_json:
-            return []
+    def diff_extract(self, old_code: str, new_code: str, old_lns: List[int], new_lns: List[int]) -> List[Dict]:
+        old_lns_str = ",".join(map(str, old_lns))
+        new_lns_str = ",".join(map(str, new_lns))
+        header = f"DIFF_EXTRACT|||{old_lns_str}|||{new_lns_str}"
+        
+        # Combine codes with a delimiter for the server to split
+        combined_code = f"{old_code}\n---DELIMITER---\n{new_code}"
+        res = self._send_command(header, combined_code)
         try:
-            return json.loads(res_json)
+            return json.loads(res) if res else []
         except Exception as e:
-            logger.error(f"Failed to parse semantic nodes JSON: {e}. Response: {res_json[:100]}")
+            logger.error(f"Failed to parse Roslyn JSON: {e}. Response: {res[:100]}...")
             return []
 
     def stop(self):
@@ -245,7 +246,7 @@ OUTPUT_FILE = os.path.join(out_dir, f"agent_run_{run_timestamp}.json")
 
 class AgentState(TypedDict):
     valid_project_dirs: List[str]
-    pull_requests: List[Dict] # Hierarchical: [{pull_request_title, pull_request_description, commits_list: []}]
+    commits: List[Dict] # Flat: [{commit_hash, commit_description, files_to_process: []}]
 
 def execute_git(cmd: str, cwd: str = REPO_PATH, check=True) -> str:
     logger.info(f"Executing Git: {cmd}")
@@ -492,7 +493,7 @@ def node_commit_filter(state: AgentState):
     logger.info(f"Commit Filter finished. Extracted {len(extracted_commits)} valid commits.")
     
     # Restituiamo il nuovo oggetto
-    return {"pull_requests": extracted_commits}
+    return {"commits": extracted_commits}
 
 def prepare_roslyn_tool():
     tool_dir = os.path.abspath("./roslyn_tool")
@@ -634,28 +635,22 @@ def process_commit(commit: Dict, tool_dir: str):
                 
             old_lns, new_lns = get_changed_line_numbers(clean_old_content, clean_new_content)
             
-            old_chunks = server.extract_semantic_nodes(clean_old_content, old_lns) if old_lns else []
-            new_chunks = server.extract_semantic_nodes(clean_new_content, new_lns) if new_lns else []
+            # Use the new Semantic Diff Alignment command
+            aligned_chunks = server.diff_extract(clean_old_content, clean_new_content, old_lns, new_lns)
             
             file_hunks = []
-            max_len = max(len(old_chunks), len(new_chunks))
-            for i in range(max_len):
-                o_dict = old_chunks[i] if i < len(old_chunks) else {"code": "", "comments": []}
-                n_dict = new_chunks[i] if i < len(new_chunks) else {"code": "", "comments": []}
+            for chunk in aligned_chunks:
+                raw_old   = minify_code(chunk.get("raw_old_code",   ""))
+                clean_old = minify_code(chunk.get("clean_old_code", ""))
+                raw_new   = minify_code(chunk.get("raw_new_code",   ""))
+                clean_new = minify_code(chunk.get("clean_new_code", ""))
                 
-                o_code = minify_code(o_dict.get("code", ""))
-                n_code = minify_code(n_dict.get("code", ""))
-                
-                # Context Window Protection
-                if len(o_code) > MAX_CHUNK_LENGTH or len(n_code) > MAX_CHUNK_LENGTH:
-                    logger.warning(f"Discarding chunk in {f} due to size limit. Old: {len(o_code)}, New: {len(n_code)}")
-                    continue
-                    
+                # Context Window Protection REMOVED per user request
                 file_hunks.append({
-                    "old_code": o_code, 
-                    "old_comments": o_dict.get("comments", []),
-                    "new_code": n_code,
-                    "new_comments": n_dict.get("comments", [])
+                    "raw_old_code":   raw_old,
+                    "clean_old_code": clean_old,
+                    "raw_new_code":   raw_new,
+                    "clean_new_code": clean_new,
                 })
                 
             if file_hunks:
@@ -694,24 +689,19 @@ def process_commit(commit: Dict, tool_dir: str):
 
 def node_roslyn_preprocessor(state: AgentState):
     logger.info("--- NODE 4: Roslyn Preprocessor (Parallel & Persistent) ---")
-    pull_requests = state["pull_requests"]
+    commits = state["commits"]
     
-    if not pull_requests:
+    if not commits:
         return state
         
     prepare_roslyn_tool()
     tool_dir = os.path.abspath("./roslyn_tool")
     
-    # Process commits in parallel across all PRs
-    all_commits = []
-    for pr in pull_requests:
-        all_commits.extend(pr["commits_list"])
-    
-    logger.info(f"Using Parallel processing for {len(all_commits)} commits...")
+    logger.info(f"Using Parallel processing for {len(commits)} commits...")
     with ThreadPoolExecutor(max_workers=4) as executor:
-        list(executor.map(lambda c: process_commit(c, tool_dir), all_commits))
+        list(executor.map(lambda c: process_commit(c, tool_dir), commits))
             
-    return {"pull_requests": pull_requests}
+    return {"commits": commits}
 
 class FileChunks(BaseModel):
     should_split: bool = Field(description="True if the code is large and contains multiple distinct semantic logical blocks that should be separated.")
@@ -726,28 +716,23 @@ def node_llm_chunker(state: AgentState):
 
 def node_json_exporter(state: AgentState):
     logger.info("--- NODE 6: JSON Exporter ---")
-    pull_requests = state.get("pull_requests", [])
+    commits = state.get("commits", [])
     
-    # Prune empty commits and empty PRs
-    valid_prs = []
-    for pr in pull_requests:
-        valid_commits = [c for c in pr.get("commits_list", []) if len(c.get("files", [])) > 0]
-        if valid_commits:
-            pr["commits_list"] = valid_commits
-            valid_prs.append(pr)
+    # Prune empty commits
+    valid_commits = [c for c in commits if len(c.get("files", [])) > 0]
             
-    logger.info(f"Pruned empty commits and PRs. Valid PRs: {len(valid_prs)} (out of {len(pull_requests)})")
+    logger.info(f"Pruned empty commits. Valid commits: {len(valid_commits)} (out of {len(commits)})")
     
     out_dir = os.path.dirname(OUTPUT_FILE)
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
         
     # Wrap in the requested structure
-    final_output = [{"pull_request": pr} for pr in valid_prs]
+    final_output = [{"commit": c} for c in valid_commits]
     
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(final_output, f, indent=4)
-        logger.info(f"Exported {len(final_output)} Pull Requests to {OUTPUT_FILE}")
+        logger.info(f"Exported {len(final_output)} Commits to {OUTPUT_FILE}")
     
     # Shutdown helpers
     if ROSLYN_SERVER:
@@ -782,6 +767,6 @@ if __name__ == "__main__":
     logger.info("Starting DroidAgent Pipeline...")
     result = app.invoke({
         "valid_project_dirs": [],
-        "pull_requests": []
+        "commits": []
     })
     logger.info("Pipeline Finished Successfully!")
