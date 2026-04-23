@@ -1,4 +1,6 @@
 import os
+import re
+import atexit
 import yaml
 import json
 import subprocess
@@ -9,13 +11,9 @@ from typing import TypedDict, List, Dict, Set, Tuple
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from concurrent.futures import ThreadPoolExecutor
-
-# Note: We keep these imports for future use when LLM is unstubbed
-from langchain_huggingface import HuggingFacePipeline
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
-import torch
+from openai import OpenAI
+from dotenv import load_dotenv
+load_dotenv()
 
 # 1. Setup Logging
 log_dir = "log"
@@ -113,8 +111,6 @@ class RoslynServer:
         old_lns_str = ",".join(map(str, old_lns))
         new_lns_str = ",".join(map(str, new_lns))
         header = f"DIFF_EXTRACT|||{old_lns_str}|||{new_lns_str}"
-        
-        # Combine codes with a delimiter for the server to split
         combined_code = f"{old_code}\n---DELIMITER---\n{new_code}"
         res = self._send_command(header, combined_code)
         try:
@@ -122,6 +118,11 @@ class RoslynServer:
         except Exception as e:
             logger.error(f"Failed to parse Roslyn JSON: {e}. Response: {res[:100]}...")
             return []
+
+    def extract_block(self, code: str, line_num: int) -> str:
+        """Extracts the semantic node (method/property/ctor) covering line_num from code."""
+        header = f"EXTRACT_BLOCK|||{line_num}"
+        return self._send_command(header, code)
 
     def stop(self):
         if self.process:
@@ -217,12 +218,66 @@ with open("config.yaml", "r") as f:
 REPO_PATH = config["repo"]["path"]
 SLN_PATH = config["repo"]["solution_path"]
 BRANCH = config["repo"]["target_branch"]
+MAX_PRS = config["repo"].get("max_prs", 10)
 
-LLM_MODEL = config["llm"]["model_name"]
-API_KEY = config["llm"].get("api_key", "no-key-required")
+LLM_MODEL = config["llm"].get("model_name", "gpt-4o-mini")
+MAX_CHUNK_LENGTH = config["llm"].get("max_chunk_length", 4000)
+ENABLE_INTENT_DISAGGREGATION = config["llm"].get("enable_intent_disaggregation", False)
 
-MAX_PRS = config["repo"]["max_prs"] if "max_prs" in config["repo"] else 10
-MAX_CHUNK_LENGTH = config["repo"]["max_chunk_length"] if "max_chunk_length" in config["repo"] else 4000
+# OpenAI client (lazy init)
+_OPENAI_CLIENT: OpenAI = None
+
+def get_openai_client() -> OpenAI:
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is None:
+        _OPENAI_CLIENT = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    return _OPENAI_CLIENT
+
+# Context cache
+CONTEXT_CACHE: Dict[str, str] = {}
+_CACHE_DIRTY_COUNT = 0
+_CACHE_AUTOSAVE_INTERVAL = 50
+CACHE_FILE = f"./cache/context_cache_{run_timestamp}.json"
+
+def init_cache():
+    os.makedirs("./cache", exist_ok=True)
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as fh:
+                CONTEXT_CACHE.update(json.load(fh))
+            logger.info(f"Loaded {len(CONTEXT_CACHE)} entries from cache: {CACHE_FILE}")
+        except Exception as e:
+            logger.warning(f"Could not load cache file: {e}")
+
+def save_cache():
+    try:
+        os.makedirs("./cache", exist_ok=True)
+        with open(CACHE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(CONTEXT_CACHE, fh, indent=2)
+        logger.info(f"Saved {len(CONTEXT_CACHE)} cache entries to {CACHE_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to save cache: {e}")
+
+atexit.register(save_cache)
+
+def maybe_autosave_cache():
+    global _CACHE_DIRTY_COUNT
+    _CACHE_DIRTY_COUNT += 1
+    if _CACHE_DIRTY_COUNT >= _CACHE_AUTOSAVE_INTERVAL:
+        save_cache()
+        _CACHE_DIRTY_COUNT = 0
+
+def _parse_llm_json(response_str: str, default):
+    """Try json.loads, strip markdown wrappers, return default on failure."""
+    if not response_str:
+        return default
+    for attempt in [response_str, re.sub(r'^```[\w]*\n?|\n?```$', '', response_str.strip())]:
+        try:
+            return json.loads(attempt)
+        except Exception:
+            continue
+    logger.warning(f"_parse_llm_json: could not parse response: {response_str[:120]}")
+    return default
 
 # Global Git Batcher
 GIT_BATCHER = GitBatcher(REPO_PATH)
@@ -239,7 +294,6 @@ def get_roslyn_server():
         tool_dir = os.path.abspath("./roslyn_tool")
         ROSLYN_SERVER = RoslynServer(tool_dir)
     return ROSLYN_SERVER
-max_chunk_size = config["llm"]["chunker"]["max_chunk_size"] if "llm" in config and "chunker" in config["llm"] else 1000
 
 out_dir = os.path.dirname(config["output"]["file_path"])
 OUTPUT_FILE = os.path.join(out_dir, f"agent_run_{run_timestamp}.json")
@@ -683,9 +737,9 @@ def process_commit(commit: Dict, tool_dir: str):
                 })
     
     commit["files"] = files_data
-    # Cleanup temporary list
+    # Preserve hash for Phase A git lookup; remove staging key
+    commit["commit_hash_ref"] = commit.pop("commit_hash")
     del commit["files_to_process"]
-    del commit["commit_hash"]
 
 def node_roslyn_preprocessor(state: AgentState):
     logger.info("--- NODE 4: Roslyn Preprocessor (Parallel & Persistent) ---")
@@ -703,16 +757,187 @@ def node_roslyn_preprocessor(state: AgentState):
             
     return {"commits": commits}
 
-class FileChunks(BaseModel):
-    should_split: bool = Field(description="True if the code is large and contains multiple distinct semantic logical blocks that should be separated.")
-    chunks: List[str] = Field(description="The source code separated into logical, cohesive parts (methods, related classes). If should_split is false, this should just contain one item with the original text.")
+# ── Phase B: Commit Intent Disaggregation ──────────────────────────────────────
+def disaggregate_commit_intent(commit: Dict) -> None:
+    if not ENABLE_INTENT_DISAGGREGATION:
+        return
+    description = commit.get("commit_description", "").strip()
+    if not description:
+        return
+    prompt = (
+        "<Role>Technical Lead</Role>\n"
+        "<Task>Deconstruct the provided commit description into a list of atomic, independent technical tasks or sub-intents.</Task>\n"
+        "<Constraints>\n"
+        "1. Extract only actionable/functional changes.\n"
+        "2. Ignore metadata (e.g., ticket numbers, reviewer names).\n"
+        "3. Output STRICTLY as a valid JSON array of strings. Do not wrap in markdown code blocks.\n"
+        "</Constraints>\n"
+        f"<InputDescription>\n{description}\n</InputDescription>"
+    )
+    try:
+        resp = get_openai_client().chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        raw = resp.choices[0].message.content
+        commit["disaggregated_intents"] = _parse_llm_json(raw, [])
+    except Exception as e:
+        logger.error(f"Phase B failed for commit: {e}")
 
+
+# ── Phase C: Atomic Diff Splitting ─────────────────────────────────────────────
+def split_large_diffs(file_obj: Dict) -> None:
+    expanded = []
+    for diff in file_obj.get("file_diffs", []):
+        total_len = len(diff.get("raw_old_code", "")) + len(diff.get("raw_new_code", ""))
+        if total_len > MAX_CHUNK_LENGTH:
+            prompt = (
+                "<Role>Git & Code Review Expert</Role>\n"
+                "<Task>Split the provided large unified diff into smaller, logically atomic sub-diffs based on independent functional changes.</Task>\n"
+                "<Constraints>\n"
+                "1. Each sub-diff must represent a standalone logical change.\n"
+                "2. Do not alter, omit, or hallucinate code content; strictly segment the existing diff.\n"
+                '3. Output STRICTLY as a JSON object without markdown wrapping: {"sub_diffs": [{"old_code": "...", "new_code": "..."}]}\n'
+                "</Constraints>\n"
+                f"<InputDiff>\nOld Code: {diff.get('raw_old_code','')}\nNew Code: {diff.get('raw_new_code','')}\n</InputDiff>"
+            )
+            try:
+                resp = get_openai_client().chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                )
+                parsed = _parse_llm_json(resp.choices[0].message.content, {})
+                sub_diffs = parsed.get("sub_diffs", [])
+                if sub_diffs:
+                    for sd in sub_diffs:
+                        expanded.append({
+                            "raw_old_code":   sd.get("old_code", ""),
+                            "clean_old_code": sd.get("old_code", ""),
+                            "raw_new_code":   sd.get("new_code", ""),
+                            "clean_new_code": sd.get("new_code", ""),
+                        })
+                    continue  # original diff replaced by sub-diffs
+            except Exception as e:
+                logger.error(f"Phase C split failed: {e}")
+        expanded.append(diff)  # unchanged or fallback
+    file_obj["file_diffs"] = expanded
+
+
+# ── Phase A: Per-diff Context Summarization ─────────────────────────────────────
+def enrich_file_diffs_with_context(file_obj: Dict, commit_hash: str) -> None:
+    if not commit_hash:
+        return
+    server  = get_roslyn_server()
+    batcher = get_git_batcher()
+    file_name = file_obj.get("file_name", "")
+
+    # Fetch the current state of the file at this commit
+    full_file = batcher.get_file_content(commit_hash, file_name)
+    if not full_file:
+        # File was deleted — skip summarization
+        return
+
+    for diff in file_obj.get("file_diffs", []):
+        raw_old = diff.get("raw_old_code", "")
+        raw_new = diff.get("raw_new_code", "")
+
+        # Find a representative line number from new_code, fall back to old_code
+        representative_code = raw_new if raw_new else raw_old
+        if not representative_code:
+            diff["context_summarization"] = "No code content available for summarization."
+            continue
+
+        # Find the first non-empty line to locate a line number in the full file
+        first_line = next((ln.strip() for ln in representative_code.splitlines() if ln.strip()), "")
+        line_num = 1
+        if first_line:
+            for idx, file_line in enumerate(full_file.splitlines(), start=1):
+                if first_line in file_line:
+                    line_num = idx
+                    break
+
+        block = server.extract_block(full_file, line_num).strip()
+
+        # Token-saving short-circuit
+        if block and block == raw_new.strip():
+            diff["context_summarization"] = "[Current code block is identical to new_code — no broader context available.]"
+            continue
+        if block and block == raw_old.strip():
+            diff["context_summarization"] = "[Current code block is identical to old_code — change may have been reverted or file deleted.]"
+            continue
+
+        if not block:
+            diff["context_summarization"] = "[Could not extract a semantic block at this location.]"
+            continue
+
+        # Cache key: file + first line of block
+        first_block_line = next((ln.strip() for ln in block.splitlines() if ln.strip()), block[:80])
+        cache_key = f"{file_name}::{first_block_line}"
+
+        if cache_key in CONTEXT_CACHE:
+            diff["context_summarization"] = CONTEXT_CACHE[cache_key]
+        else:
+            prompt = (
+                "<Role>Senior C# Software Engineer</Role>\n"
+                "<Task>Analyze the provided C# code block and summarize its core functional responsibility within the system.</Task>\n"
+                "<Constraints>\n"
+                "1. Maximum 2-3 sentences.\n"
+                "2. Focus on 'what' it does and 'why', avoiding line-by-line descriptions.\n"
+                "3. Do not include code snippets, markdown blocks, or conversational filler.\n"
+                "4. Return only the plain text summary.\n"
+                "</Constraints>\n"
+                f"<InputCode>\n{block}\n</InputCode>"
+            )
+            try:
+                resp = get_openai_client().chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                )
+                summary = resp.choices[0].message.content.strip()
+            except Exception as e:
+                logger.error(f"Phase A LLM call failed for {file_name}: {e}")
+                summary = "[Summarization failed.]"
+
+            CONTEXT_CACHE[cache_key] = summary
+            maybe_autosave_cache()
+            diff["context_summarization"] = summary
+
+
+# ── Node 5: LLM Enrichment ──────────────────────────────────────────────────────
 def node_llm_chunker(state: AgentState):
-    logger.info("--- NODE 5: LLM-Assisted Semantic Chunker (STUBBED) ---")
-    logger.info("Note: LLM chunking is currently stubbed per user request.")
-    # In the future, this would iterate through state["pull_requests"] -> commits_list -> files
-    # and split the 'text' into chunks if needed.
-    return state
+    logger.info("--- NODE 5: LLM Enrichment (Context / Intent / Splitting) ---")
+    commits = state["commits"]
+    init_cache()
+
+    # Phase B: per-commit intent disaggregation (optional)
+    if ENABLE_INTENT_DISAGGREGATION:
+        logger.info("Phase B: Commit Intent Disaggregation...")
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(disaggregate_commit_intent, commits))
+    else:
+        logger.info("Phase B: Disabled (enable_intent_disaggregation=false)")
+
+    # Build flat (file_obj, commit_hash) pairs for Phase A & C
+    file_commit_pairs = [
+        (f, c.get("commit_hash_ref", ""))
+        for c in commits for f in c.get("files", [])
+    ]
+
+    # Phase C: split large diffs first (before summarization)
+    logger.info(f"Phase C: Atomic Diff Splitting on {len(file_commit_pairs)} files...")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(lambda p: split_large_diffs(p[0]), file_commit_pairs))
+
+    # Phase A: per-diff context summarization
+    logger.info(f"Phase A: Context Summarization on {len(file_commit_pairs)} files...")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(lambda p: enrich_file_diffs_with_context(p[0], p[1]), file_commit_pairs))
+
+    save_cache()
+    return {"commits": commits}
 
 def node_json_exporter(state: AgentState):
     logger.info("--- NODE 6: JSON Exporter ---")
@@ -727,8 +952,12 @@ def node_json_exporter(state: AgentState):
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
         
-    # Wrap in the requested structure
-    final_output = [{"commit": c} for c in valid_commits]
+    # Wrap in the requested structure; strip internal helper fields
+    def _clean_commit(c: Dict) -> Dict:
+        out = {k: v for k, v in c.items() if k != "commit_hash_ref"}
+        return out
+
+    final_output = [{"commit": _clean_commit(c)} for c in valid_commits]
     
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(final_output, f, indent=4)

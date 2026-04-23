@@ -15,11 +15,11 @@ namespace RoslynPreprocessor
 
         private static string GetIdentity(SyntaxNode node)
         {
-            if (node is MethodDeclarationSyntax m) 
+            if (node is MethodDeclarationSyntax m)
                 return $"method:{m.Identifier.Text}({string.Join(",", m.ParameterList.Parameters.Select(p => p.Type?.ToString()))})";
-            if (node is PropertyDeclarationSyntax p) 
+            if (node is PropertyDeclarationSyntax p)
                 return $"prop:{p.Identifier.Text}";
-            if (node is ConstructorDeclarationSyntax c) 
+            if (node is ConstructorDeclarationSyntax c)
                 return $"ctor:({string.Join(",", c.ParameterList.Parameters.Select(p => p.Type?.ToString()))})";
             return node.ToString();
         }
@@ -37,15 +37,15 @@ namespace RoslynPreprocessor
                 if (lineNum <= 0 || lineNum > text.Lines.Count) continue;
                 var line = text.Lines[lineNum - 1];
                 var node = root.FindNode(line.Span);
-                while (node != null && 
-                       !(node is MethodDeclarationSyntax) && 
-                       !(node is PropertyDeclarationSyntax) && 
-                       !(node is ConstructorDeclarationSyntax) && 
+                while (node != null &&
+                       !(node is MethodDeclarationSyntax) &&
+                       !(node is PropertyDeclarationSyntax) &&
+                       !(node is ConstructorDeclarationSyntax) &&
                        !(node is ClassDeclarationSyntax))
                 {
                     node = node.Parent;
                 }
-                
+
                 if (node != null)
                 {
                     if (node is ClassDeclarationSyntax classNode)
@@ -55,9 +55,7 @@ namespace RoslynPreprocessor
                             if (member is MethodDeclarationSyntax || member is PropertyDeclarationSyntax || member is ConstructorDeclarationSyntax)
                             {
                                 if (member.Span.IntersectsWith(line.Span))
-                                {
                                     semanticNodes.Add(member);
-                                }
                             }
                         }
                     }
@@ -96,6 +94,50 @@ namespace RoslynPreprocessor
             return new { raw_code = rawCode, clean_code = cleanCode };
         }
 
+        /// <summary>
+        /// Finds the semantic node covering the given 1-based line and returns
+        /// its full text with all original comments/trivia preserved.
+        /// Returns empty string if no node found.
+        /// </summary>
+        private static string ExtractBlock(string code, int lineNum)
+        {
+            if (string.IsNullOrWhiteSpace(code)) return "";
+            var tree = CSharpSyntaxTree.ParseText(code);
+            var root = tree.GetRoot();
+            var text = tree.GetText();
+
+            if (lineNum <= 0 || lineNum > text.Lines.Count) return "";
+            var line = text.Lines[lineNum - 1];
+
+            var node = root.FindNode(line.Span);
+            while (node != null &&
+                   !(node is MethodDeclarationSyntax) &&
+                   !(node is PropertyDeclarationSyntax) &&
+                   !(node is ConstructorDeclarationSyntax) &&
+                   !(node is ClassDeclarationSyntax))
+            {
+                node = node.Parent;
+            }
+
+            if (node == null) return "";
+
+            // If we landed on a class, pick the member that actually intersects the line
+            if (node is ClassDeclarationSyntax cls)
+            {
+                foreach (var member in cls.Members)
+                {
+                    if ((member is MethodDeclarationSyntax || member is PropertyDeclarationSyntax || member is ConstructorDeclarationSyntax)
+                        && member.Span.IntersectsWith(line.Span))
+                    {
+                        return member.NormalizeWhitespace().ToFullString();
+                    }
+                }
+                return node.NormalizeWhitespace().ToFullString();
+            }
+
+            return node.NormalizeWhitespace().ToFullString();
+        }
+
         static void Main(string[] args)
         {
             Console.InputEncoding = Encoding.UTF8;
@@ -110,6 +152,7 @@ namespace RoslynPreprocessor
 
                 try
                 {
+                    // ── CLEAN: strip preprocessor / comment trivia ──────────────────
                     if (commandLine.StartsWith("CLEAN|||"))
                     {
                         var codeBuilder = new StringBuilder();
@@ -124,8 +167,8 @@ namespace RoslynPreprocessor
                         var root = tree.GetRoot();
                         var cleanRoot = root.ReplaceTrivia(
                             root.DescendantTrivia(descendIntoTrivia: true)
-                                .Where(t => t.IsKind(SyntaxKind.SingleLineCommentTrivia) || 
-                                            t.IsKind(SyntaxKind.MultiLineCommentTrivia) || 
+                                .Where(t => t.IsKind(SyntaxKind.SingleLineCommentTrivia) ||
+                                            t.IsKind(SyntaxKind.MultiLineCommentTrivia) ||
                                             t.IsKind(SyntaxKind.SingleLineDocumentationCommentTrivia) ||
                                             t.IsKind(SyntaxKind.MultiLineDocumentationCommentTrivia) ||
                                             t.IsKind(SyntaxKind.DocumentationCommentExteriorTrivia)),
@@ -133,6 +176,7 @@ namespace RoslynPreprocessor
                         );
                         Console.WriteLine(cleanRoot.ToFullString());
                     }
+                    // ── DIFF_EXTRACT: aligned semantic diff pairs ───────────────────
                     else if (commandLine.StartsWith("DIFF_EXTRACT|||"))
                     {
                         var parts = commandLine.Split(new[] { "|||" }, StringSplitOptions.None);
@@ -177,9 +221,9 @@ namespace RoslynPreprocessor
                             dynamic newChunk = CreateChunk(newNode);
 
                             pairs.Add(new {
-                                raw_old_code = oldChunk.raw_code,
+                                raw_old_code   = oldChunk.raw_code,
                                 clean_old_code = oldChunk.clean_code,
-                                raw_new_code = newChunk.raw_code,
+                                raw_new_code   = newChunk.raw_code,
                                 clean_new_code = newChunk.clean_code
                             });
                         }
@@ -200,14 +244,31 @@ namespace RoslynPreprocessor
                             dynamic newChunk = CreateChunk(newNode);
 
                             pairs.Add(new {
-                                raw_old_code = oldChunk.raw_code,
+                                raw_old_code   = oldChunk.raw_code,
                                 clean_old_code = oldChunk.clean_code,
-                                raw_new_code = newChunk.raw_code,
+                                raw_new_code   = newChunk.raw_code,
                                 clean_new_code = newChunk.clean_code
                             });
                         }
 
                         Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(pairs));
+                    }
+                    // ── EXTRACT_BLOCK: current-state block for LLM summarization ───
+                    else if (commandLine.StartsWith("EXTRACT_BLOCK|||"))
+                    {
+                        var parts = commandLine.Split(new[] { "|||" }, StringSplitOptions.None);
+                        int lineNum = int.Parse(parts[1]);
+
+                        var codeBuilder = new StringBuilder();
+                        while (true)
+                        {
+                            var line = Console.ReadLine();
+                            if (line == null || line == Sentinel) break;
+                            codeBuilder.AppendLine(line);
+                        }
+
+                        var result = ExtractBlock(codeBuilder.ToString(), lineNum);
+                        Console.WriteLine(result);
                     }
                 }
                 catch (Exception ex)

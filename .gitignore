@@ -5,4 +5,6 @@ bin/
 temp_code.cs
 output/
 log/
+cache/
 __pycache__/
+.env
