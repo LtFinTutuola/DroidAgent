@@ -250,7 +250,17 @@ class AgentState(TypedDict):
 def execute_git(cmd: str, cwd: str = REPO_PATH, check=True) -> str:
     logger.info(f"Executing Git: {cmd}")
     try:
-        res = subprocess.run(cmd, cwd=cwd, shell=True, text=True, capture_output=True, check=check)
+        # Aggiunti encoding='utf-8' ed errors='replace' per prevenire UnicodeDecodeError su Windows
+        res = subprocess.run(
+            cmd, 
+            cwd=cwd, 
+            shell=True, 
+            text=True, 
+            capture_output=True, 
+            encoding='utf-8', 
+            errors='replace', 
+            check=check
+        )
         return res.stdout.strip() if res.stdout else ""
     except subprocess.CalledProcessError as e:
         logger.error(f"Git command failed: {cmd} - {e.stderr}")
@@ -400,74 +410,89 @@ def resolve_pr_description(initial_description: str, current_commit_hash: str = 
     return initial_description
 
 def node_commit_filter(state: AgentState):
-    logger.info("--- NODE 3: History & Commit Filter ---")
-    valid_dirs = state["valid_project_dirs"]
+    logger.info("--- NODE 3: History & Commit Filter (Flat Commit Mode) ---")
+    raw_valid_dirs = state.get("valid_project_dirs", [])
     
-    # Fetch a larger batch of PRs to ensure we can find 10 relevant ones
-    merges_out = execute_git(f'git log origin/{BRANCH} --merges --first-parent --pretty=format:"%H|%s" -n 50')
-    lines = merges_out.split("\n") if merges_out else []
+    if not raw_valid_dirs:
+        logger.warning("No valid directories provided to node_commit_filter.")
+        return {"pull_requests": []} # Aggiornato per riflettere il nuovo stato
     
-    pull_requests = []
+    # --- 1. DEFINIZIONE DEL CONTESTO DI ESECUZIONE ---
+    sln_folder_name = "TCPOS.DroidPos"
+    sln_cwd = os.path.join(REPO_PATH, sln_folder_name)
+    
+    # --- 2. PREPARAZIONE PERCORSI ---
+    normalized_dirs = set()
+    git_dirs = []
+    
+    for d in raw_valid_dirs:
+        safe_d = d if d else "."
+        # Per il comando Git
+        git_dirs.append(f'"{safe_d.replace(chr(92), "/")}"')
+        
+        # Per la funzione is_valid_file (normalizziamo rispetto alla root)
+        norm_path = os.path.normpath(os.path.join(sln_folder_name, safe_d))
+        normalized_dirs.add(norm_path.replace('\\', '/'))
+        
+    dirs_string = " ".join(git_dirs)
+    valid_dirs_normalized = list(normalized_dirs)
+    
+    # --- 3. ESTRAZIONE DEI COMMIT ---
+    logger.info(f"Fetching commits for valid paths...")
+    git_log_cmd = f'git --no-pager log origin/{BRANCH} --pretty=format:"%H|%s" -- {dirs_string}'
+    
+    commits_out = execute_git(git_log_cmd, cwd=sln_cwd)
+    lines = commits_out.split("\n") if commits_out else []
+    
+    # Nuova lista piatta per i commit
+    extracted_commits = []
 
     for line in lines:
-        if len(pull_requests) >= MAX_PRS:
+        if len(extracted_commits) >= MAX_PRS: # Puoi rinominare MAX_PRS in MAX_COMMITS nel tuo config
             break
             
         if not line: continue
-        parts = line.split("|")
+        parts = line.split("|", 1)
         if len(parts) < 2: continue
         
-        pr_hash, pr_title = parts[0], parts[1]
+        cHash = parts[0].strip()
+        cTitle = parts[1].strip()
         
-        pr_description_raw = execute_git(f"git show -s --format=%b {pr_hash}")
-        pr_description = pr_description_raw.strip() if pr_description_raw else "No description provided"
-        if not pr_description:
-            pr_description = "No description provided"
+        # --- 4. ESTRAZIONE E FILTRAGGIO DEI FILE ---
+        changed_c_files = execute_git(f'git show --name-only --format="" {cHash}', cwd=sln_cwd).split("\n")
+        
+        files_to_process = []
+        for f in changed_c_files:
+            f_stripped = f.strip()
+            if not f_stripped: continue
             
-        pr_description = resolve_pr_description(pr_description, pr_hash)
+            # FILTRO RIPRISTINATO: Teniamo solo i file che appartengono ai progetti della solution
+            if is_valid_file(f_stripped, valid_dirs_normalized):
+                files_to_process.append({"name": f_stripped})
         
-        parents_out = execute_git(f"git show -s --format=%P {pr_hash}")
-        parents = parents_out.split()
-        if len(parents) < 2: 
-            logger.info(f"  Skipping PR commit {pr_hash[:8]} (not a merge)")
-            continue
-        base_commit, branch_commit = parents[0], parents[1]
-        
-        changed_pr_files = execute_git(f"git diff --name-only {base_commit}...{branch_commit}").split("\n")
-        relevant_files = [f for f in changed_pr_files if f and is_valid_file(f, valid_dirs)]
-        
-        if relevant_files:
-            logger.info(f"  PR '{pr_title}' is relevant ({len(relevant_files)} files).")
-            commits_in_pr = execute_git(f"git log --pretty=format:\"%H\" {base_commit}..{branch_commit}").split("\n")
+        # --- 5. ASSEMBLAGGIO DEL SINGOLO COMMIT ---
+        if files_to_process:
+            logger.info(f"    Found {len(files_to_process)} solution files in commit {cHash[:8]}")
             
-            commits_list = []
-            for cHash in commits_in_pr:
-                if not cHash: continue
-                changed_c_files = execute_git(f"git show --name-only --format=\"\" {cHash}").split("\n")
-                
-                # Only process files that are in DroidPos and are valid types
-                files_to_process = []
-                for f in changed_c_files:
-                    if not f: continue
-                    if is_valid_file(f, valid_dirs):
-                        files_to_process.append({"name": f})
-                
-                if files_to_process:
-                    logger.info(f"    Found {len(files_to_process)} relevant files in commit {cHash[:8]}")
-                    commits_list.append({
-                        "commit_hash": cHash,
-                        "files_to_process": files_to_process
-                    })
+            # Recuperiamo il body del commit
+            c_desc_raw = execute_git(f'git show -s --format=%b {cHash}', cwd=sln_cwd)
+            c_desc_body = c_desc_raw.strip() if c_desc_raw else ""
             
-            if commits_list:
-                pull_requests.append({
-                    "pull_request_title": pr_title,
-                    "pull_request_description": pr_description,
-                    "commits_list": commits_list
-                })
+            # Uniamo il titolo (soggetto) e il corpo per creare una descrizione completa
+            full_description = f"{cTitle}\n\n{c_desc_body}".strip()
+            full_description = resolve_pr_description(full_description, cHash)
+            
+            # Popoliamo la nuova struttura dati
+            extracted_commits.append({
+                "commit_hash": cHash,
+                "commit_description": full_description,
+                "files_to_process": files_to_process
+            })
 
-    logger.info(f"Commit Filter finished. Extracted PRs: {len(pull_requests)}")
-    return {"pull_requests": pull_requests}
+    logger.info(f"Commit Filter finished. Extracted {len(extracted_commits)} valid commits.")
+    
+    # Restituiamo il nuovo oggetto
+    return {"pull_requests": extracted_commits}
 
 def prepare_roslyn_tool():
     tool_dir = os.path.abspath("./roslyn_tool")
