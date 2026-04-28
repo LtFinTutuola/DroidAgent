@@ -12,6 +12,7 @@ namespace RoslynPreprocessor
     class Program
     {
         const string Sentinel = "===END_OF_CODE===";
+        private static readonly CSharpParseOptions ParseOptions = new CSharpParseOptions(preprocessorSymbols: new[] { "MonoDroid" });
 
         private static string GetIdentity(SyntaxNode node)
         {
@@ -27,7 +28,7 @@ namespace RoslynPreprocessor
         private static List<SyntaxNode> GetSemanticNodes(string code, List<int> lines)
         {
             if (string.IsNullOrWhiteSpace(code)) return new List<SyntaxNode>();
-            var tree = CSharpSyntaxTree.ParseText(code);
+            var tree = CSharpSyntaxTree.ParseText(code, ParseOptions);
             var root = tree.GetRoot();
             var semanticNodes = new HashSet<SyntaxNode>();
 
@@ -77,16 +78,14 @@ namespace RoslynPreprocessor
             {
                 SyntaxKind.SingleLineCommentTrivia,
                 SyntaxKind.MultiLineCommentTrivia,
-                SyntaxKind.SingleLineDocumentationCommentTrivia,
-                SyntaxKind.MultiLineDocumentationCommentTrivia,
-                SyntaxKind.DocumentationCommentExteriorTrivia,
+                SyntaxKind.DisabledTextTrivia,
             };
 
             var cleanNode = n.ReplaceTrivia(
                 n.DescendantTrivia(descendIntoTrivia: true)
                     .Concat(n.GetLeadingTrivia())
                     .Concat(n.GetTrailingTrivia())
-                    .Where(t => commentKinds.Contains(t.Kind())),
+                    .Where(t => commentKinds.Contains(t.Kind()) || t.IsDirective),
                 (original, _) => SyntaxFactory.ElasticMarker
             );
             var cleanCode = cleanNode.NormalizeWhitespace().ToFullString();
@@ -103,7 +102,7 @@ namespace RoslynPreprocessor
         {
             var empty = System.Text.Json.JsonSerializer.Serialize(new { signature = "", block_code = "" });
             if (string.IsNullOrWhiteSpace(code)) return empty;
-            var tree = CSharpSyntaxTree.ParseText(code);
+            var tree = CSharpSyntaxTree.ParseText(code, ParseOptions);
             var root = tree.GetRoot();
             var text = tree.GetText();
 
@@ -173,15 +172,14 @@ namespace RoslynPreprocessor
                             codeBuilder.AppendLine(line);
                         }
                         var code = codeBuilder.ToString();
-                        var tree = CSharpSyntaxTree.ParseText(code);
+                        var tree = CSharpSyntaxTree.ParseText(code, ParseOptions);
                         var root = tree.GetRoot();
                         var cleanRoot = root.ReplaceTrivia(
                             root.DescendantTrivia(descendIntoTrivia: true)
                                 .Where(t => t.IsKind(SyntaxKind.SingleLineCommentTrivia) ||
                                             t.IsKind(SyntaxKind.MultiLineCommentTrivia) ||
-                                            t.IsKind(SyntaxKind.SingleLineDocumentationCommentTrivia) ||
-                                            t.IsKind(SyntaxKind.MultiLineDocumentationCommentTrivia) ||
-                                            t.IsKind(SyntaxKind.DocumentationCommentExteriorTrivia)),
+                                            t.IsKind(SyntaxKind.DisabledTextTrivia) ||
+                                            t.IsDirective),
                             (original, _) => SyntaxFactory.ElasticMarker
                         );
                         Console.WriteLine(cleanRoot.ToFullString());
@@ -209,8 +207,8 @@ namespace RoslynPreprocessor
                         var oldNodes = GetSemanticNodes(oldCode, oldLns);
                         var newNodes = GetSemanticNodes(newCode, newLns);
 
-                        var oldTree = string.IsNullOrWhiteSpace(oldCode) ? null : CSharpSyntaxTree.ParseText(oldCode).GetRoot();
-                        var newTree = string.IsNullOrWhiteSpace(newCode) ? null : CSharpSyntaxTree.ParseText(newCode).GetRoot();
+                        var oldTree = string.IsNullOrWhiteSpace(oldCode) ? null : CSharpSyntaxTree.ParseText(oldCode, ParseOptions).GetRoot();
+                        var newTree = string.IsNullOrWhiteSpace(newCode) ? null : CSharpSyntaxTree.ParseText(newCode, ParseOptions).GetRoot();
 
                         var pairs = new List<object>();
                         var processedNewIdentities = new HashSet<string>();

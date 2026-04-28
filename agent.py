@@ -244,12 +244,20 @@ _CACHE_AUTOSAVE_INTERVAL = 50
 CACHE_FILE = f"./cache/context_cache_{run_timestamp}.json"
 
 def init_cache():
+    global CACHE_FILE
     os.makedirs("./cache", exist_ok=True)
-    if os.path.exists(CACHE_FILE):
+    if config["llm"].get("reset_cache", False):
+        logger.info("reset_cache is True. Starting with empty cache.")
+        return
+    import glob
+    cache_files = glob.glob("./cache/context_cache_*.json")
+    if cache_files:
         try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as fh:
+            latest_file = max(cache_files, key=os.path.getmtime)
+            with open(latest_file, "r", encoding="utf-8") as fh:
                 CONTEXT_CACHE.update(json.load(fh))
-            logger.info(f"Loaded {len(CONTEXT_CACHE)} entries from cache: {CACHE_FILE}")
+            CACHE_FILE = latest_file
+            logger.info(f"Loaded {len(CONTEXT_CACHE)} entries from cache: {latest_file}. Future updates will be saved here.")
         except Exception as e:
             logger.warning(f"Could not load cache file: {e}")
 
@@ -280,6 +288,15 @@ def _parse_llm_json(response_str: str, default):
             return json.loads(attempt)
         except Exception:
             continue
+            
+    # Robust fallback: extract JSON substring
+    match = re.search(r'(\{.*\}|\[.*\])', response_str, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            pass
+            
     logger.warning(f"_parse_llm_json: could not parse response: {response_str[:120]}")
     return default
 
@@ -661,6 +678,11 @@ def minify_code(text: str) -> str:
     text = re.sub(r'(?m)^[ \t]+', '', text)
     return text.strip()
 
+def is_meaningful_diff_basic(clean_old: str, clean_new: str) -> bool:
+    """Return True if diff contains semantic logic shift, False if it is purely whitespace."""
+    if not clean_old and not clean_new: return False
+    return re.sub(r'\s+', '', clean_old) != re.sub(r'\s+', '', clean_new)
+
 def process_commit(commit: Dict, tool_dir: str):
     cHash = commit["commit_hash"]
     commit["commit_description"] = execute_git(f"git show -s --format=%B {cHash}")
@@ -703,6 +725,9 @@ def process_commit(commit: Dict, tool_dir: str):
                 raw_new   = minify_code(chunk.get("raw_new_code",   ""))
                 clean_new = minify_code(chunk.get("clean_new_code", ""))
                 
+                if not is_meaningful_diff_basic(clean_old, clean_new):
+                    continue
+                
                 # Context Window Protection REMOVED per user request
                 file_hunks.append({
                     "raw_old_code":   raw_old,
@@ -733,11 +758,16 @@ def process_commit(commit: Dict, tool_dir: str):
             ))
             
             parsed_hunks = parse_unified_diff(diff_lines)
-            if parsed_hunks:
-                logger.info(f"Adding {f}: found {len(parsed_hunks)} expanded context hunks")
+            filtered_hunks = []
+            for h in parsed_hunks:
+                if is_meaningful_diff_basic(h["old_code"], h["new_code"]):
+                    filtered_hunks.append(h)
+                    
+            if filtered_hunks:
+                logger.info(f"Adding {f}: found {len(filtered_hunks)} expanded context hunks")
                 files_data.append({
                     "file_name": f,
-                    "file_diffs": parsed_hunks
+                    "file_diffs": filtered_hunks
                 })
     
     commit["files"] = files_data
@@ -774,7 +804,7 @@ def disaggregate_commit_intent(commit: Dict) -> None:
         "<Constraints>\n"
         "1. Extract only actionable/functional changes.\n"
         "2. Ignore metadata (e.g., ticket numbers, reviewer names).\n"
-        "3. Output STRICTLY as a valid JSON array of strings. Do not wrap in markdown code blocks.\n"
+        "3. Output STRICTLY as a valid JSON array of strings. Do not use markdown formatting (no ```json). Do not include any preamble or text.\n"
         "</Constraints>\n"
         f"<InputDescription>\n{description}\n</InputDescription>"
     )
@@ -811,7 +841,7 @@ def split_large_diffs(file_obj: Dict) -> None:
                 "<Constraints>\n"
                 "1. Each sub-diff must represent a standalone logical change.\n"
                 "2. Do NOT alter, omit, or hallucinate code content; strictly segment the existing code.\n"
-                '3. Output STRICTLY as a JSON object without markdown wrapping: {"sub_diffs": [{"raw_old_code": "...", "raw_new_code": "..."}]}\n'
+                '3. Output STRICTLY as a JSON object without markdown wrapping (no ```json). Do not include any preamble, explanations, or conversational text. Your entire response must be valid, parsable JSON: {"sub_diffs": [{"raw_old_code": "...", "raw_new_code": "..."}]}\n'
                 "</Constraints>\n"
                 f"<InputDiff>\nOld Code: {diff.get('raw_old_code','')}\nNew Code: {diff.get('raw_new_code','')}\n</InputDiff>"
             )
@@ -833,6 +863,10 @@ def split_large_diffs(file_obj: Dict) -> None:
                             clean_new = server.clean_code(raw_new) if raw_new else ""
                         else:
                             clean_old, clean_new = raw_old, raw_new
+                            
+                        if not is_meaningful_diff_basic(clean_old, clean_new):
+                            continue
+                            
                         expanded.append({
                             "raw_old_code":   raw_old,
                             "clean_old_code": clean_old,
@@ -888,13 +922,14 @@ def _xml_extract_parent_block(xml_text: str, search_text: str) -> str:
     return xml_text[start:end]
 
 
-def _build_context_prompt(file_name: str, block: str) -> str:
+def _build_context_prompt(file_name: str, block: str, raw_old: str, raw_new: str) -> str:
     """Route to the correct specialised prompt based on file extension."""
     no_ctx_instruction = (
-        "If the provided code block is purely whitespace formatting, entirely empty, "
-        "or lacks any meaningful functional/UI logic to describe, "
-        'you MUST reply with exactly the string: [NO_CONTEXT]\n'
+        "PRE-FLIGHT CHECK: First evaluate the InputDiff. If the change solely consists of irrelevant noise such as typo corrections, "
+        "basic variable renaming with no functional shift, or dead-code deletion, YOU MUST output exactly: [NO_CONTEXT]\n"
+        "If the change is semantically meaningful, provide the 2-3 sentence summary of the InputCode block, ignoring the diff details.\n"
     )
+    diff_payload = f"<InputDiff>\nOld:\n{raw_old}\nNew:\n{raw_new}\n</InputDiff>\n"
     if file_name.endswith(".csproj"):
         return (
             "<Role>.NET Architect</Role>\n"
@@ -907,6 +942,7 @@ def _build_context_prompt(file_name: str, block: str) -> str:
             f"4. {no_ctx_instruction}"
             "5. Return only the plain text summary or [NO_CONTEXT].\n"
             "</Constraints>\n"
+            f"{diff_payload}"
             f"<InputCode>\n{block}\n</InputCode>"
         )
     elif file_name.endswith(".xaml") and not file_name.endswith(".xaml.cs"):
@@ -921,6 +957,7 @@ def _build_context_prompt(file_name: str, block: str) -> str:
             f"4. {no_ctx_instruction}"
             "5. Return only the plain text summary or [NO_CONTEXT].\n"
             "</Constraints>\n"
+            f"{diff_payload}"
             f"<InputCode>\n{block}\n</InputCode>"
         )
     else:  # .cs and .xaml.cs
@@ -935,6 +972,7 @@ def _build_context_prompt(file_name: str, block: str) -> str:
             f"4. {no_ctx_instruction}"
             "5. Return only the plain text summary or [NO_CONTEXT].\n"
             "</Constraints>\n"
+            f"{diff_payload}"
             f"<InputCode>\n{block}\n</InputCode>"
         )
 
@@ -1006,7 +1044,7 @@ def enrich_file_diffs_with_context(file_obj: Dict, commit_hash: str) -> None:
         if cache_key in CONTEXT_CACHE:
             diff["context_summarization"] = CONTEXT_CACHE[cache_key]
         else:
-            prompt = _build_context_prompt(file_name, block)
+            prompt = _build_context_prompt(file_name, block, raw_old, raw_new)
             try:
                 resp = get_openai_client().chat.completions.create(
                     model=LLM_MODEL,
