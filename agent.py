@@ -678,10 +678,21 @@ def minify_code(text: str) -> str:
     text = re.sub(r'(?m)^[ \t]+', '', text)
     return text.strip()
 
-def is_meaningful_diff_basic(clean_old: str, clean_new: str) -> bool:
-    """Return True if diff contains semantic logic shift, False if it is purely whitespace."""
-    if not clean_old and not clean_new: return False
-    return re.sub(r'\s+', '', clean_old) != re.sub(r'\s+', '', clean_new)
+def get_diff_char_count(clean_old: str, clean_new: str) -> int:
+    """Returns 0 if purely whitespace/identical, otherwise returns the number of changed characters."""
+    if not clean_old and not clean_new: 
+        return 0
+    
+    str_old = re.sub(r'\s+', '', clean_old)
+    str_new = re.sub(r'\s+', '', clean_new)
+    
+    if str_old == str_new: 
+        return 0
+        
+    diff = difflib.ndiff(str_old, str_new)
+    changed_chars = sum(1 for d in diff if d.startswith('+ ') or d.startswith('- '))
+    
+    return changed_chars
 
 def process_commit(commit: Dict, tool_dir: str):
     cHash = commit["commit_hash"]
@@ -707,16 +718,16 @@ def process_commit(commit: Dict, tool_dir: str):
         clean_new_content = new_content
         
         if f.endswith(".cs"):
-            clean_old_content = server.clean_code(old_content) if old_content else ""
-            clean_new_content = server.clean_code(new_content) if new_content else ""
-            
-            if clean_old_content == clean_new_content:
+            # 1. Saltiamo se i file crudi sono identici
+            if old_content == new_content:
                 continue
                 
-            old_lns, new_lns = get_changed_line_numbers(clean_old_content, clean_new_content)
+            # 2. Calcoliamo i numeri di riga sui file ORIGINALI (raw). 
+            # È vitale per mantenere l'allineamento corretto quando passiamo il testo a Roslyn.
+            old_lns, new_lns = get_changed_line_numbers(old_content, new_content)
             
-            # Use the new Semantic Diff Alignment command
-            aligned_chunks = server.diff_extract(clean_old_content, clean_new_content, old_lns, new_lns)
+            # 3. Passiamo i file ORIGINALI a Roslyn, in modo che CreateChunk abbia accesso ai commenti per il raw_code!
+            aligned_chunks = server.diff_extract(old_content, new_content, old_lns, new_lns)
             
             file_hunks = []
             for chunk in aligned_chunks:
@@ -725,16 +736,22 @@ def process_commit(commit: Dict, tool_dir: str):
                 raw_new   = minify_code(chunk.get("raw_new_code",   ""))
                 clean_new = minify_code(chunk.get("clean_new_code", ""))
                 
-                if not is_meaningful_diff_basic(clean_old, clean_new):
+                changed_chars = get_diff_char_count(clean_old, clean_new)
+                if changed_chars == 0:
                     continue
                 
-                # Context Window Protection REMOVED per user request
-                file_hunks.append({
+                chunk_data = {
                     "raw_old_code":   raw_old,
                     "clean_old_code": clean_old,
                     "raw_new_code":   raw_new,
                     "clean_new_code": clean_new,
-                })
+                }
+                
+                # Aggiunge il flag SOLO se i caratteri cambiati sono meno di 10
+                if changed_chars < 10:
+                    chunk_data["manual_review"] = True
+                    
+                file_hunks.append(chunk_data)
                 
             if file_hunks:
                 logger.info(f"Adding {f}: extracted {len(file_hunks)} semantic chunks")
@@ -760,7 +777,10 @@ def process_commit(commit: Dict, tool_dir: str):
             parsed_hunks = parse_unified_diff(diff_lines)
             filtered_hunks = []
             for h in parsed_hunks:
-                if is_meaningful_diff_basic(h["old_code"], h["new_code"]):
+                changed_chars = get_diff_char_count(h["old_code"], h["new_code"])
+                if changed_chars > 0:
+                    if changed_chars < 10:
+                        h["manual_review"] = True
                     filtered_hunks.append(h)
                     
             if filtered_hunks:
@@ -864,15 +884,22 @@ def split_large_diffs(file_obj: Dict) -> None:
                         else:
                             clean_old, clean_new = raw_old, raw_new
                             
-                        if not is_meaningful_diff_basic(clean_old, clean_new):
+                        changed_chars = get_diff_char_count(clean_old, clean_new)
+                        if changed_chars == 0:
                             continue
                             
-                        expanded.append({
+                        chunk_data = {
                             "raw_old_code":   raw_old,
                             "clean_old_code": clean_old,
                             "raw_new_code":   raw_new,
                             "clean_new_code": clean_new,
-                        })
+                        }
+                        
+                        # Aggiunge il flag SOLO se i caratteri cambiati sono meno di 10
+                        if changed_chars < 10:
+                            chunk_data["manual_review"] = True
+                            
+                        expanded.append(chunk_data)
                     continue  # original diff replaced by sub-diffs
             except Exception as e:
                 logger.error(f"Phase C split failed: {e}")

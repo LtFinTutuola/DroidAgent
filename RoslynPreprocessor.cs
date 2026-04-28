@@ -69,25 +69,37 @@ namespace RoslynPreprocessor
             return semanticNodes.OrderBy(n => n.SpanStart).ToList();
         }
 
+        private static bool IsCommentOrDirective(SyntaxTrivia t)
+        {
+            var kind = t.Kind();
+            return kind == SyntaxKind.SingleLineCommentTrivia ||
+                kind == SyntaxKind.MultiLineCommentTrivia ||
+                kind == SyntaxKind.SingleLineDocumentationCommentTrivia ||
+                kind == SyntaxKind.MultiLineDocumentationCommentTrivia ||
+                kind == SyntaxKind.DocumentationCommentExteriorTrivia ||
+                kind == SyntaxKind.XmlComment ||
+                kind == SyntaxKind.DisabledTextTrivia ||
+                t.IsDirective;
+        }
+
         private static object CreateChunk(SyntaxNode n)
         {
             if (n == null) return new { raw_code = "", clean_code = "" };
 
-            var rawCode = n.NormalizeWhitespace().ToFullString();
-            var commentKinds = new HashSet<SyntaxKind>
-            {
-                SyntaxKind.SingleLineCommentTrivia,
-                SyntaxKind.MultiLineCommentTrivia,
-                SyntaxKind.DisabledTextTrivia,
-            };
+            // 1. RAW: Genera il codice mantenendo TUTTA la formattazione e i commenti originali.
+            // NON usare .NormalizeWhitespace() qui.
+            var rawCode = n.ToFullString(); 
 
+            // 2. CLEAN: Rimuove i commenti tramite la funzione IsCommentOrDirective
             var cleanNode = n.ReplaceTrivia(
                 n.DescendantTrivia(descendIntoTrivia: true)
                     .Concat(n.GetLeadingTrivia())
                     .Concat(n.GetTrailingTrivia())
-                    .Where(t => commentKinds.Contains(t.Kind()) || t.IsDirective),
+                    .Where(IsCommentOrDirective),
                 (original, _) => SyntaxFactory.ElasticMarker
             );
+            
+            // Formatta il codice pulito in modo standardizzato
             var cleanCode = cleanNode.NormalizeWhitespace().ToFullString();
 
             return new { raw_code = rawCode, clean_code = cleanCode };
@@ -179,6 +191,10 @@ namespace RoslynPreprocessor
                                 .Where(t => t.IsKind(SyntaxKind.SingleLineCommentTrivia) ||
                                             t.IsKind(SyntaxKind.MultiLineCommentTrivia) ||
                                             t.IsKind(SyntaxKind.DisabledTextTrivia) ||
+                                            t.IsKind(SyntaxKind.SingleLineDocumentationCommentTrivia) ||
+                                            t.IsKind(SyntaxKind.MultiLineDocumentationCommentTrivia) ||
+                                            t.IsKind(SyntaxKind.DocumentationCommentExteriorTrivia) ||
+                                            t.IsKind(SyntaxKind.XmlComment) ||
                                             t.IsDirective),
                             (original, _) => SyntaxFactory.ElasticMarker
                         );
