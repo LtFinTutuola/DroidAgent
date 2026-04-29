@@ -81,7 +81,7 @@ SYSTEM_PROMPT = (
     "7. Keep it strictly to 1 or 2 concise sentences maximum."
 )
 
-USER_PROMPT_TEMPLATE = """\
+USER_PROMPT_CSHARP = """\
 Analyze the provided Commit context, the file name, and the raw code modifications. 
 Synthesize the ideal user prompt/instruction that would command THIS EXACT software change.
 
@@ -91,6 +91,58 @@ CRITICAL CONSTRAINTS:
 - Bridge the gap between Business Intent and Technical Implementation. Analyze the [CODE DIFF] to understand WHAT changed, but use the [COMMIT CONTEXT] to understand WHY.
 - Frame the instruction as a logical problem to solve, NOT as a dictation of keystrokes.
 - If `raw_old_code` is empty or missing, formulate it as a creation request: "Add the [ExactNameFromDiff] method/property to the [ClassName] class to handle [Business Logic]".
+- Output ONLY the imperative instruction.
+
+[COMMIT CONTEXT]
+commit_description: {commit_description}
+
+[FILE INFO]
+file_name: {file_name}
+
+[CODE DIFF]
+raw_old_code: 
+{raw_old_code}
+
+raw_new_code: 
+{raw_new_code}
+"""
+
+USER_PROMPT_XAML = """\
+Analyze the provided Commit context, the file name, and the raw XML modifications. 
+Synthesize the ideal user prompt/instruction that would command THIS EXACT UI/markup change.
+
+CRITICAL CONSTRAINTS:
+- Identify the UI control or markup element being changed from the [CODE DIFF]. 
+- Use the provided `file_name` to deduce the name of the view, page, or layout component being modified. Incorporate this name NATURALLY into the instruction to avoid ambiguity (e.g., "in the UserProfile view"). Do NOT output the raw file path.
+- Bridge the gap between Business Intent and Technical Implementation. Use UI/Markup terminology (e.g., "Update the layout", "Modify the UI control", "Adjust the visual property"). Analyze the [CODE DIFF] to understand WHAT changed, but use the [COMMIT CONTEXT] to understand WHY.
+- Frame the instruction as a logical UI change to implement.
+- If `raw_old_code` is empty or missing, formulate it as an addition: "Add the [ElementName] control to the [ViewName] to display [Business Logic]".
+- Output ONLY the imperative instruction.
+
+[COMMIT CONTEXT]
+commit_description: {commit_description}
+
+[FILE INFO]
+file_name: {file_name}
+
+[CODE DIFF]
+raw_old_code: 
+{raw_old_code}
+
+raw_new_code: 
+{raw_new_code}
+"""
+
+USER_PROMPT_CSPROJ = """\
+Analyze the provided Commit context, the file name, and the raw project file modifications. 
+Synthesize the ideal user prompt/instruction that would command THIS EXACT architectural or dependency change.
+
+CRITICAL CONSTRAINTS:
+- Identify the exact dependency, build property, or architectural setting changed in the [CODE DIFF]. 
+- Use the provided `file_name` to deduce the name of the project. Incorporate this name NATURALLY into the instruction to avoid ambiguity (e.g., "in the Core project"). Do NOT output the raw file path.
+- Bridge the gap between Business Intent and Technical Implementation. Use architectural terminology (e.g., "Add the dependency", "Update the build property", "Link the package").
+- Frame the instruction as an architectural or build-system goal.
+- If `raw_old_code` is empty or missing, formulate it as an addition.
 - Output ONLY the imperative instruction.
 
 [COMMIT CONTEXT]
@@ -150,7 +202,14 @@ def generate_explanation(
     raw_old = diff.get("raw_old_code", "") or ""
     raw_new = diff.get("raw_new_code", "") or ""
 
-    user_msg = USER_PROMPT_TEMPLATE.format(
+    if file_name.endswith(".xaml"):
+        prompt_template = USER_PROMPT_XAML
+    elif file_name.endswith(".csproj"):
+        prompt_template = USER_PROMPT_CSPROJ
+    else:
+        prompt_template = USER_PROMPT_CSHARP
+
+    user_msg = prompt_template.format(
         commit_description=commit_description,
         file_name=file_name,
         raw_old_code=raw_old,
