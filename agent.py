@@ -1,4 +1,6 @@
 import os
+import re
+import atexit
 import yaml
 import json
 import subprocess
@@ -9,13 +11,9 @@ from typing import TypedDict, List, Dict, Set, Tuple
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from concurrent.futures import ThreadPoolExecutor
-
-# Note: We keep these imports for future use when LLM is unstubbed
-from langchain_huggingface import HuggingFacePipeline
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
-import torch
+from openai import OpenAI
+from dotenv import load_dotenv
+load_dotenv()
 
 # 1. Setup Logging
 log_dir = "log"
@@ -113,8 +111,6 @@ class RoslynServer:
         old_lns_str = ",".join(map(str, old_lns))
         new_lns_str = ",".join(map(str, new_lns))
         header = f"DIFF_EXTRACT|||{old_lns_str}|||{new_lns_str}"
-        
-        # Combine codes with a delimiter for the server to split
         combined_code = f"{old_code}\n---DELIMITER---\n{new_code}"
         res = self._send_command(header, combined_code)
         try:
@@ -122,6 +118,15 @@ class RoslynServer:
         except Exception as e:
             logger.error(f"Failed to parse Roslyn JSON: {e}. Response: {res[:100]}...")
             return []
+
+    def extract_block(self, code: str, line_num: int) -> Dict:
+        """Extracts the semantic node covering line_num. Returns {signature, block_code}."""
+        header = f"EXTRACT_BLOCK|||{line_num}"
+        res = self._send_command(header, code)
+        try:
+            return json.loads(res) if res else {"signature": "", "block_code": ""}
+        except Exception:
+            return {"signature": "", "block_code": res or ""}
 
     def stop(self):
         if self.process:
@@ -217,12 +222,83 @@ with open("config.yaml", "r") as f:
 REPO_PATH = config["repo"]["path"]
 SLN_PATH = config["repo"]["solution_path"]
 BRANCH = config["repo"]["target_branch"]
+MAX_PRS = config["repo"].get("max_prs", 10)
 
-LLM_MODEL = config["llm"]["model_name"]
-API_KEY = config["llm"].get("api_key", "no-key-required")
+LLM_MODEL = config["llm"].get("model_name", "gpt-4o-mini")
+MAX_CHUNK_LENGTH = config["llm"].get("max_chunk_length", 4000)
+ENABLE_INTENT_DISAGGREGATION = config["llm"].get("enable_intent_disaggregation", False)
 
-MAX_PRS = config["repo"]["max_prs"] if "max_prs" in config["repo"] else 10
-MAX_CHUNK_LENGTH = config["repo"]["max_chunk_length"] if "max_chunk_length" in config["repo"] else 4000
+# OpenAI client (lazy init)
+_OPENAI_CLIENT: OpenAI = None
+
+def get_openai_client() -> OpenAI:
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is None:
+        _OPENAI_CLIENT = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    return _OPENAI_CLIENT
+
+# Context cache
+CONTEXT_CACHE: Dict[str, str] = {}
+_CACHE_DIRTY_COUNT = 0
+_CACHE_AUTOSAVE_INTERVAL = 50
+CACHE_FILE = f"./cache/context_cache_{run_timestamp}.json"
+
+def init_cache():
+    global CACHE_FILE
+    os.makedirs("./cache", exist_ok=True)
+    if config["llm"].get("reset_cache", False):
+        logger.info("reset_cache is True. Starting with empty cache.")
+        return
+    import glob
+    cache_files = glob.glob("./cache/context_cache_*.json")
+    if cache_files:
+        try:
+            latest_file = max(cache_files, key=os.path.getmtime)
+            with open(latest_file, "r", encoding="utf-8") as fh:
+                CONTEXT_CACHE.update(json.load(fh))
+            CACHE_FILE = latest_file
+            logger.info(f"Loaded {len(CONTEXT_CACHE)} entries from cache: {latest_file}. Future updates will be saved here.")
+        except Exception as e:
+            logger.warning(f"Could not load cache file: {e}")
+
+def save_cache():
+    try:
+        os.makedirs("./cache", exist_ok=True)
+        with open(CACHE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(CONTEXT_CACHE, fh, indent=2)
+        logger.info(f"Saved {len(CONTEXT_CACHE)} cache entries to {CACHE_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to save cache: {e}")
+
+atexit.register(save_cache)
+
+def maybe_autosave_cache():
+    global _CACHE_DIRTY_COUNT
+    _CACHE_DIRTY_COUNT += 1
+    if _CACHE_DIRTY_COUNT >= _CACHE_AUTOSAVE_INTERVAL:
+        save_cache()
+        _CACHE_DIRTY_COUNT = 0
+
+def _parse_llm_json(response_str: str, default):
+    """Try json.loads, strip markdown wrappers, return default on failure."""
+    if not response_str:
+        return default
+    for attempt in [response_str, re.sub(r'^```[\w]*\n?|\n?```$', '', response_str.strip())]:
+        try:
+            return json.loads(attempt)
+        except Exception:
+            continue
+            
+    # Robust fallback: extract JSON substring
+    match = re.search(r'(\{.*\}|\[.*\])', response_str, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            pass
+            
+    logger.warning(f"_parse_llm_json: could not parse response: {response_str[:120]}")
+    return default
 
 # Global Git Batcher
 GIT_BATCHER = GitBatcher(REPO_PATH)
@@ -239,7 +315,6 @@ def get_roslyn_server():
         tool_dir = os.path.abspath("./roslyn_tool")
         ROSLYN_SERVER = RoslynServer(tool_dir)
     return ROSLYN_SERVER
-max_chunk_size = config["llm"]["chunker"]["max_chunk_size"] if "llm" in config and "chunker" in config["llm"] else 1000
 
 out_dir = os.path.dirname(config["output"]["file_path"])
 OUTPUT_FILE = os.path.join(out_dir, f"agent_run_{run_timestamp}.json")
@@ -603,6 +678,142 @@ def minify_code(text: str) -> str:
     text = re.sub(r'(?m)^[ \t]+', '', text)
     return text.strip()
 
+def get_diff_char_count(clean_old: str, clean_new: str) -> int:
+    """Returns 0 if purely whitespace/identical, otherwise returns the number of changed characters."""
+    if not clean_old and not clean_new: 
+        return 0
+    
+    str_old = re.sub(r'\s+', '', clean_old)
+    str_new = re.sub(r'\s+', '', clean_new)
+    
+    if str_old == str_new: 
+        return 0
+        
+    diff = difflib.ndiff(str_old, str_new)
+    changed_chars = sum(1 for d in diff if d.startswith('+ ') or d.startswith('- '))
+    
+    return changed_chars
+
+from lxml import etree
+import copy
+
+class XmlPreprocessor:
+    def __init__(self):
+        self.parser = etree.XMLParser(recover=True, remove_blank_text=False)
+
+    def extract_skeletons(self, xml_text: str, changed_lines: List[int]) -> List[etree._Element]:
+        if not xml_text or not changed_lines:
+            return []
+        try:
+            root = etree.fromstring(xml_text.encode('utf-8'), parser=self.parser)
+        except Exception as e:
+            logger.error(f"XML parse error: {e}")
+            return []
+
+        targets = []
+        for el in root.iter():
+            if isinstance(el.tag, str) and el.sourceline in changed_lines:
+                targets.append(el)
+
+        skeletons = []
+        processed_paths = set()
+
+        for t_node in targets:
+            path = etree.ElementTree(root).getpath(t_node)
+            if path in processed_paths:
+                continue
+            processed_paths.add(path)
+
+            p_node = t_node.getparent()
+
+            if p_node is None:
+                skel = etree.Element(t_node.tag, attrib=t_node.attrib, nsmap=t_node.nsmap)
+                has_element_children = any(isinstance(c.tag, str) for c in t_node)
+                if not has_element_children:
+                    skel.text = t_node.text
+                    for c in t_node:
+                        skel.append(copy.deepcopy(c))
+                skeletons.append(skel)
+            else:
+                skel_p = etree.Element(p_node.tag, attrib=p_node.attrib, nsmap=p_node.nsmap)
+                skel_t = etree.Element(t_node.tag, attrib=t_node.attrib, nsmap=t_node.nsmap)
+                
+                has_element_children = any(isinstance(c.tag, str) for c in t_node)
+                if not has_element_children:
+                    skel_t.text = t_node.text
+                    for c in t_node:
+                        skel_t.append(copy.deepcopy(c))
+                        
+                skel_p.append(skel_t)
+                skeletons.append(skel_p)
+
+        return skeletons
+
+    def canonicalize(self, element: etree._Element) -> str:
+        el = copy.deepcopy(element)
+        etree.strip_tags(el, etree.Comment)
+        for node in el.iter():
+            if isinstance(node.tag, str):
+                attrs = sorted(node.attrib.items())
+                node.attrib.clear()
+                for k, v in attrs:
+                    node.attrib[k] = v
+        raw_str = etree.tostring(el, encoding='unicode')
+        lines = []
+        for line in raw_str.splitlines():
+            clean_line = re.sub(r'[ \t]+', ' ', line).strip()
+            if clean_line:
+                lines.append(clean_line)
+        return "\n".join(lines)
+
+    def process(self, old_content: str, new_content: str, old_lns: List[int], new_lns: List[int]) -> List[Dict]:
+        old_skeletons = self.extract_skeletons(old_content, old_lns)
+        new_skeletons = self.extract_skeletons(new_content, new_lns)
+        
+        chunks = []
+        
+        def get_key(node):
+            if node is None: return ""
+            target = next((c for c in node if isinstance(c.tag, str)), None)
+            target_tag = target.tag if target is not None else node.tag
+            return f"{node.tag}_{target_tag}"
+
+        paired = []
+        used_new = set()
+        for o_node in old_skeletons:
+            o_key = get_key(o_node)
+            best_match_idx = -1
+            for i, n_node in enumerate(new_skeletons):
+                if i in used_new: continue
+                if get_key(n_node) == o_key:
+                    best_match_idx = i
+                    break
+            if best_match_idx != -1:
+                paired.append((o_node, new_skeletons[best_match_idx]))
+                used_new.add(best_match_idx)
+            else:
+                paired.append((o_node, None))
+                
+        for i, n_node in enumerate(new_skeletons):
+            if i not in used_new:
+                paired.append((None, n_node))
+                
+        for o_node, n_node in paired:
+            raw_old = etree.tostring(o_node, encoding='unicode') if o_node is not None else ""
+            clean_old = self.canonicalize(o_node) if o_node is not None else ""
+            
+            raw_new = etree.tostring(n_node, encoding='unicode') if n_node is not None else ""
+            clean_new = self.canonicalize(n_node) if n_node is not None else ""
+            
+            chunks.append({
+                "raw_old_code": raw_old.strip(),
+                "clean_old_code": clean_old.strip(),
+                "raw_new_code": raw_new.strip(),
+                "clean_new_code": clean_new.strip(),
+            })
+            
+        return chunks
+
 def process_commit(commit: Dict, tool_dir: str):
     cHash = commit["commit_hash"]
     commit["commit_description"] = execute_git(f"git show -s --format=%B {cHash}")
@@ -627,16 +838,16 @@ def process_commit(commit: Dict, tool_dir: str):
         clean_new_content = new_content
         
         if f.endswith(".cs"):
-            clean_old_content = server.clean_code(old_content) if old_content else ""
-            clean_new_content = server.clean_code(new_content) if new_content else ""
-            
-            if clean_old_content == clean_new_content:
+            # 1. Saltiamo se i file crudi sono identici
+            if old_content == new_content:
                 continue
                 
-            old_lns, new_lns = get_changed_line_numbers(clean_old_content, clean_new_content)
+            # 2. Calcoliamo i numeri di riga sui file ORIGINALI (raw). 
+            # È vitale per mantenere l'allineamento corretto quando passiamo il testo a Roslyn.
+            old_lns, new_lns = get_changed_line_numbers(old_content, new_content)
             
-            # Use the new Semantic Diff Alignment command
-            aligned_chunks = server.diff_extract(clean_old_content, clean_new_content, old_lns, new_lns)
+            # 3. Passiamo i file ORIGINALI a Roslyn, in modo che CreateChunk abbia accesso ai commenti per il raw_code!
+            aligned_chunks = server.diff_extract(old_content, new_content, old_lns, new_lns)
             
             file_hunks = []
             for chunk in aligned_chunks:
@@ -645,13 +856,22 @@ def process_commit(commit: Dict, tool_dir: str):
                 raw_new   = minify_code(chunk.get("raw_new_code",   ""))
                 clean_new = minify_code(chunk.get("clean_new_code", ""))
                 
-                # Context Window Protection REMOVED per user request
-                file_hunks.append({
+                changed_chars = get_diff_char_count(clean_old, clean_new)
+                if changed_chars == 0:
+                    continue
+                
+                chunk_data = {
                     "raw_old_code":   raw_old,
                     "clean_old_code": clean_old,
                     "raw_new_code":   raw_new,
                     "clean_new_code": clean_new,
-                })
+                }
+                
+                # Aggiunge il flag SOLO se i caratteri cambiati sono meno di 10
+                if changed_chars < 10:
+                    chunk_data["manual_review"] = True
+                    
+                file_hunks.append(chunk_data)
                 
             if file_hunks:
                 logger.info(f"Adding {f}: extracted {len(file_hunks)} semantic chunks")
@@ -659,33 +879,34 @@ def process_commit(commit: Dict, tool_dir: str):
                     "file_name": f,
                     "file_diffs": file_hunks
                 })
-        elif f.endswith(".xaml") or f.endswith(".csproj"):
-            if old_content:
-                clean_old_content = re.sub(r'\n\s*\n', '\n\n', old_content).strip()
-            if new_content:
-                clean_new_content = re.sub(r'\n\s*\n', '\n\n', new_content).strip()
-                
-            if clean_old_content == clean_new_content:
+        elif f.endswith((".xaml", ".csproj", ".xml")):
+            if old_content == new_content:
                 continue
                 
-            diff_lines = list(difflib.unified_diff(
-                clean_old_content.splitlines(), 
-                clean_new_content.splitlines(), 
-                n=5, lineterm=''
-            ))
+            old_lns, new_lns = get_changed_line_numbers(old_content, new_content)
             
-            parsed_hunks = parse_unified_diff(diff_lines)
-            if parsed_hunks:
-                logger.info(f"Adding {f}: found {len(parsed_hunks)} expanded context hunks")
+            processor = XmlPreprocessor()
+            filtered_hunks = []
+            
+            for h in processor.process(old_content, new_content, old_lns, new_lns):
+                changed_chars = get_diff_char_count(h["clean_old_code"], h["clean_new_code"])
+                if changed_chars == 0:
+                    continue
+                if changed_chars < 10:
+                    h["manual_review"] = True
+                filtered_hunks.append(h)
+                    
+            if filtered_hunks:
+                logger.info(f"Adding {f}: found {len(filtered_hunks)} xml skeleton hunks")
                 files_data.append({
                     "file_name": f,
-                    "file_diffs": parsed_hunks
+                    "file_diffs": filtered_hunks
                 })
     
     commit["files"] = files_data
-    # Cleanup temporary list
+    # Preserve hash for Phase A git lookup; remove staging key
+    commit["commit_hash_ref"] = commit.pop("commit_hash")
     del commit["files_to_process"]
-    del commit["commit_hash"]
 
 def node_roslyn_preprocessor(state: AgentState):
     logger.info("--- NODE 4: Roslyn Preprocessor (Parallel & Persistent) ---")
@@ -703,43 +924,198 @@ def node_roslyn_preprocessor(state: AgentState):
             
     return {"commits": commits}
 
-class FileChunks(BaseModel):
-    should_split: bool = Field(description="True if the code is large and contains multiple distinct semantic logical blocks that should be separated.")
-    chunks: List[str] = Field(description="The source code separated into logical, cohesive parts (methods, related classes). If should_split is false, this should just contain one item with the original text.")
+# ── Phase B: Commit Intent Disaggregation ──────────────────────────────────────
+def disaggregate_commit_intent(commit: Dict) -> None:
+    if not ENABLE_INTENT_DISAGGREGATION:
+        return
+    description = commit.get("commit_description", "").strip()
+    if not description:
+        return
+    prompt = (
+        "<Role>Technical Lead</Role>\n"
+        "<Task>Deconstruct the provided commit description into a list of atomic, independent technical tasks or sub-intents.</Task>\n"
+        "<Constraints>\n"
+        "1. Extract only actionable/functional changes.\n"
+        "2. Ignore metadata (e.g., ticket numbers, reviewer names).\n"
+        "3. Output STRICTLY as a valid JSON array of strings. Do not use markdown formatting (no ```json). Do not include any preamble or text.\n"
+        "</Constraints>\n"
+        f"<InputDescription>\n{description}\n</InputDescription>"
+    )
+    try:
+        resp = get_openai_client().chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        raw = resp.choices[0].message.content
+        commit["disaggregated_intents"] = _parse_llm_json(raw, [])
+    except Exception as e:
+        logger.error(f"Phase B failed for commit: {e}")
 
-def node_llm_chunker(state: AgentState):
-    logger.info("--- NODE 5: LLM-Assisted Semantic Chunker (STUBBED) ---")
-    logger.info("Note: LLM chunking is currently stubbed per user request.")
-    # In the future, this would iterate through state["pull_requests"] -> commits_list -> files
-    # and split the 'text' into chunks if needed.
+
+# ── Phase C: Atomic Diff Splitting (4-Key Preservation) ───────────────────────
+_NO_CONTEXT_STRINGS = frozenset([
+    "[NO_CONTEXT]",
+    "[Summarization failed.]",
+    "[Could not extract a semantic block at this location.]",
+    "No code content available for summarization.",
+])
+
+def split_large_diffs(file_obj: Dict) -> None:
+    server = get_roslyn_server()
+    expanded = []
+    is_cs = file_obj.get("file_name", "").endswith(".cs")
+    for diff in file_obj.get("file_diffs", []):
+        total_len = len(diff.get("raw_old_code", "")) + len(diff.get("raw_new_code", ""))
+        if total_len > MAX_CHUNK_LENGTH:
+            prompt = (
+                "<Role>Git & Code Review Expert</Role>\n"
+                "<Task>Split the provided large diff into smaller, logically atomic sub-diffs based on independent functional changes.</Task>\n"
+                "<Constraints>\n"
+                "1. Each sub-diff must represent a standalone logical change.\n"
+                "2. Do NOT alter, omit, or hallucinate code content; strictly segment the existing code.\n"
+                '3. Output STRICTLY as a JSON object without markdown wrapping (no ```json). Do not include any preamble, explanations, or conversational text. Your entire response must be valid, parsable JSON: {"sub_diffs": [{"raw_old_code": "...", "raw_new_code": "..."}]}\n'
+                "</Constraints>\n"
+                f"<InputDiff>\nOld Code: {diff.get('raw_old_code','')}\nNew Code: {diff.get('raw_new_code','')}\n</InputDiff>"
+            )
+            try:
+                resp = get_openai_client().chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                )
+                parsed = _parse_llm_json(resp.choices[0].message.content, {})
+                sub_diffs = parsed.get("sub_diffs", [])
+                if sub_diffs:
+                    for sd in sub_diffs:
+                        raw_old = sd.get("raw_old_code", "")
+                        raw_new = sd.get("raw_new_code", "")
+                        # Deterministic clean-track via Roslyn (only for C# files)
+                        if is_cs:
+                            clean_old = server.clean_code(raw_old) if raw_old else ""
+                            clean_new = server.clean_code(raw_new) if raw_new else ""
+                        else:
+                            clean_old, clean_new = raw_old, raw_new
+                            
+                        changed_chars = get_diff_char_count(clean_old, clean_new)
+                        if changed_chars == 0:
+                            continue
+                            
+                        chunk_data = {
+                            "raw_old_code":   raw_old,
+                            "clean_old_code": clean_old,
+                            "raw_new_code":   raw_new,
+                            "clean_new_code": clean_new,
+                        }
+                        
+                        # Aggiunge il flag SOLO se i caratteri cambiati sono meno di 10
+                        if changed_chars < 10:
+                            chunk_data["manual_review"] = True
+                            
+                        expanded.append(chunk_data)
+                    continue  # original diff replaced by sub-diffs
+            except Exception as e:
+                logger.error(f"Phase C split failed: {e}")
+        expanded.append(diff)  # unchanged or fallback
+    file_obj["file_diffs"] = expanded
+
+
+# ── Phase A: Per-diff Context Summarization (Dual-Track) ──────────────────────
+_NO_CONTEXT_REPLY = "[NO_CONTEXT]"
+
+def _xml_extract_parent_block(xml_text: str, search_text: str) -> str:
+    """Find the enclosing XML/XAML element that contains search_text using simple tag walking."""
+    if not search_text or not xml_text:
+        return ""
+    idx = xml_text.find(search_text)
+    if idx == -1:
+        # Try the first non-whitespace line of search_text
+        first = next((ln.strip() for ln in search_text.splitlines() if ln.strip()), "")
+        idx = xml_text.find(first)
+    if idx == -1:
+        return xml_text[:2000]  # fallback: first 2000 chars
+
+    # Walk backwards to find the opening tag of the enclosing element
+    start = xml_text.rfind('<', 0, idx)
+    while start > 0 and xml_text[start + 1] in ('!', '?', '/'):
+        start = xml_text.rfind('<', 0, start)
+
+    if start == -1:
+        return xml_text[:2000]
+
+    # Tag name
+    tag_end = start + 1
+    while tag_end < len(xml_text) and xml_text[tag_end] not in (' ', '\t', '\n', '\r', '>'):
+        tag_end += 1
+    tag_name = xml_text[start + 1:tag_end]
+    if not tag_name:
+        return xml_text[:2000]
+
+    # Find the matching closing tag
+    close_tag = f"</{tag_name}>"
+    end = xml_text.find(close_tag, idx)
+    if end == -1:
+        end = min(start + 3000, len(xml_text))
+    else:
+        end += len(close_tag)
+
+    return xml_text[start:end]
+
+
+# ── Node 5: LLM Enrichment ──────────────────────────────────────────────────────
+def node_llm_chunker(state: AgentState) -> AgentState:
+    logger.info("--- NODE 5: LLM Chunker (Passthrough) ---")
+    # Non facciamo nulla, passiamo i dati così come sono al nodo successivo
     return state
+
 
 def node_json_exporter(state: AgentState):
     logger.info("--- NODE 6: JSON Exporter ---")
     commits = state.get("commits", [])
-    
+
+    # ── Prune [NO_CONTEXT] diffs and empty files ───────────────────────────────
+    pruned_diff_count  = 0
+    pruned_file_count  = 0
+    for commit in commits:
+        valid_files = []
+        for file_obj in commit.get("files", []):
+            valid_diffs = [
+                d for d in file_obj.get("file_diffs", [])
+            ]
+            pruned_diff_count += len(file_obj.get("file_diffs", [])) - len(valid_diffs)
+            if valid_diffs:
+                file_obj["file_diffs"] = valid_diffs
+                valid_files.append(file_obj)
+            else:
+                pruned_file_count += 1
+        commit["files"] = valid_files
+
+    logger.info(f"Pruned {pruned_diff_count} [NO_CONTEXT] diffs and {pruned_file_count} empty files.")
+
     # Prune empty commits
-    valid_commits = [c for c in commits if len(c.get("files", [])) > 0]
-            
-    logger.info(f"Pruned empty commits. Valid commits: {len(valid_commits)} (out of {len(commits)})")
-    
+    valid_commits = [c for c in commits if c.get("files")]
+    logger.info(f"Valid commits after pruning: {len(valid_commits)} (out of {len(commits)})")
+
     out_dir = os.path.dirname(OUTPUT_FILE)
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
-        
-    # Wrap in the requested structure
-    final_output = [{"commit": c} for c in valid_commits]
-    
+
+    # Strip internal helper fields before export
+    def _clean_commit(c: Dict) -> Dict:
+        return {k: v for k, v in c.items() if k != "commit_hash_ref"}
+
+    final_output = [{"commit": _clean_commit(c)} for c in valid_commits]
+
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(final_output, f, indent=4)
         logger.info(f"Exported {len(final_output)} Commits to {OUTPUT_FILE}")
-    
+
     # Shutdown helpers
     if ROSLYN_SERVER:
         ROSLYN_SERVER.stop()
     if GIT_BATCHER:
         GIT_BATCHER.stop()
-        
+
     return state
 
 # ---- BUILD LANGGRAPH PIPELINE ----
@@ -757,8 +1133,7 @@ workflow.add_edge(START, "context_manager")
 workflow.add_edge("context_manager", "solution_mapper")
 workflow.add_edge("solution_mapper", "commit_filter")
 workflow.add_edge("commit_filter", "roslyn_processor")
-workflow.add_edge("roslyn_processor", "llm_chunker")
-workflow.add_edge("llm_chunker", "json_exporter")
+workflow.add_edge("roslyn_processor", "json_exporter")
 workflow.add_edge("json_exporter", END)
 
 app = workflow.compile()
