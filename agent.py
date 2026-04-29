@@ -949,177 +949,12 @@ def _xml_extract_parent_block(xml_text: str, search_text: str) -> str:
     return xml_text[start:end]
 
 
-def _build_context_prompt(file_name: str, block: str, raw_old: str, raw_new: str) -> str:
-    """Route to the correct specialised prompt based on file extension."""
-    no_ctx_instruction = (
-        "PRE-FLIGHT CHECK: First evaluate the InputDiff. If the change solely consists of irrelevant noise such as typo corrections, "
-        "basic variable renaming with no functional shift, or dead-code deletion, YOU MUST output exactly: [NO_CONTEXT]\n"
-        "If the change is semantically meaningful, provide the 2-3 sentence summary of the InputCode block, ignoring the diff details.\n"
-    )
-    diff_payload = f"<InputDiff>\nOld:\n{raw_old}\nNew:\n{raw_new}\n</InputDiff>\n"
-    if file_name.endswith(".csproj"):
-        return (
-            "<Role>.NET Architect</Role>\n"
-            "<Task>Analyze this .csproj project configuration block. Describe the architectural impact "
-            "(e.g., added NuGet dependency, target framework change, project reference).</Task>\n"
-            "<Constraints>\n"
-            "1. Maximum 2-3 sentences.\n"
-            "2. Focus on 'what changed' and 'why it matters architecturally'.\n"
-            "3. Do not include code snippets, markdown blocks, or conversational filler.\n"
-            f"4. {no_ctx_instruction}"
-            "5. Return only the plain text summary or [NO_CONTEXT].\n"
-            "</Constraints>\n"
-            f"{diff_payload}"
-            f"<InputCode>\n{block}\n</InputCode>"
-        )
-    elif file_name.endswith(".xaml") and not file_name.endswith(".xaml.cs"):
-        return (
-            "<Role>UI/UX Developer</Role>\n"
-            "<Task>Analyze this XAML UI code block. Describe which part of the screen or visual component "
-            "is being defined or altered in this POS system.</Task>\n"
-            "<Constraints>\n"
-            "1. Maximum 2-3 sentences.\n"
-            "2. Focus on the visual/interaction purpose, not XML syntax.\n"
-            "3. Do not include code snippets, markdown blocks, or conversational filler.\n"
-            f"4. {no_ctx_instruction}"
-            "5. Return only the plain text summary or [NO_CONTEXT].\n"
-            "</Constraints>\n"
-            f"{diff_payload}"
-            f"<InputCode>\n{block}\n</InputCode>"
-        )
-    else:  # .cs and .xaml.cs
-        return (
-            "<Role>Senior C# Software Engineer</Role>\n"
-            "<Task>Analyze the provided C# code block and summarize its core functional responsibility "
-            "within this POS system.</Task>\n"
-            "<Constraints>\n"
-            "1. Maximum 2-3 sentences.\n"
-            "2. Focus on 'what' it does and 'why', avoiding line-by-line descriptions.\n"
-            "3. Do not include code snippets, markdown blocks, or conversational filler.\n"
-            f"4. {no_ctx_instruction}"
-            "5. Return only the plain text summary or [NO_CONTEXT].\n"
-            "</Constraints>\n"
-            f"{diff_payload}"
-            f"<InputCode>\n{block}\n</InputCode>"
-        )
-
-
-def enrich_file_diffs_with_context(file_obj: Dict, commit_hash: str) -> None:
-    if not commit_hash:
-        return
-    server    = get_roslyn_server()
-    batcher   = get_git_batcher()
-    file_name = file_obj.get("file_name", "")
-
-    # Fetch the current state of the file at this commit
-    full_file = batcher.get_file_content(commit_hash, file_name)
-    if not full_file:
-        return  # File was deleted — skip summarization
-
-    is_cs   = file_name.endswith(".cs")          # includes .xaml.cs
-    is_xml  = file_name.endswith(".csproj") or (file_name.endswith(".xaml") and not is_cs)
-
-    for diff in file_obj.get("file_diffs", []):
-        raw_old = diff.get("raw_old_code", "")
-        raw_new = diff.get("raw_new_code", "")
-
-        representative_code = raw_new if raw_new else raw_old
-        if not representative_code:
-            diff["context_summarization"] = _NO_CONTEXT_REPLY
-            continue
-
-        # ── Track 1: C# → Roslyn EXTRACT_BLOCK ────────────────────────────────
-        if is_cs:
-            # Find the first non-empty line to locate a line number in the full file
-            first_line = next((ln.strip() for ln in representative_code.splitlines() if ln.strip()), "")
-            line_num = 1
-            if first_line:
-                for idx, file_line in enumerate(full_file.splitlines(), start=1):
-                    if first_line in file_line:
-                        line_num = idx
-                        break
-
-            result = server.extract_block(full_file, line_num)  # returns {signature, block_code}
-            signature  = result.get("signature", "")
-            block      = result.get("block_code", "").strip()
-            cache_key  = f"{file_name}::{signature}" if signature else f"{file_name}::line{line_num}"
-
-            # Token-saving short-circuit
-            if block and block == raw_new.strip():
-                diff["context_summarization"] = "[Current code block is identical to new_code — no broader context available.]"
-                continue
-            if block and block == raw_old.strip():
-                diff["context_summarization"] = "[Current code block is identical to old_code — change may have been reverted.]"
-                continue
-            if not block:
-                diff["context_summarization"] = _NO_CONTEXT_REPLY
-                continue
-
-        # ── Track 2: XML/XAML → Python parent-node extraction ─────────────────
-        elif is_xml:
-            block     = _xml_extract_parent_block(full_file, representative_code)
-            cache_key = f"{file_name}::{block[:80].strip()}"
-            if not block.strip():
-                diff["context_summarization"] = _NO_CONTEXT_REPLY
-                continue
-
-        else:
-            diff["context_summarization"] = _NO_CONTEXT_REPLY
-            continue
-
-        # ── Cache lookup / LLM call ────────────────────────────────────────────
-        if cache_key in CONTEXT_CACHE:
-            diff["context_summarization"] = CONTEXT_CACHE[cache_key]
-        else:
-            prompt = _build_context_prompt(file_name, block, raw_old, raw_new)
-            try:
-                resp = get_openai_client().chat.completions.create(
-                    model=LLM_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
-                )
-                summary = resp.choices[0].message.content.strip()
-            except Exception as e:
-                logger.error(f"Phase A LLM call failed for {file_name}: {e}")
-                summary = "[Summarization failed.]"
-
-            CONTEXT_CACHE[cache_key] = summary
-            maybe_autosave_cache()
-            diff["context_summarization"] = summary
-
-
 # ── Node 5: LLM Enrichment ──────────────────────────────────────────────────────
-def node_llm_chunker(state: AgentState):
-    logger.info("--- NODE 5: LLM Enrichment (Context / Intent / Splitting) ---")
-    commits = state["commits"]
-    init_cache()
+def node_llm_chunker(state: AgentState) -> AgentState:
+    logger.info("--- NODE 5: LLM Chunker (Passthrough) ---")
+    # Non facciamo nulla, passiamo i dati così come sono al nodo successivo
+    return state
 
-    # Phase B: per-commit intent disaggregation (optional)
-    if ENABLE_INTENT_DISAGGREGATION:
-        logger.info("Phase B: Commit Intent Disaggregation...")
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            list(ex.map(disaggregate_commit_intent, commits))
-    else:
-        logger.info("Phase B: Disabled (enable_intent_disaggregation=false)")
-
-    # Build flat (file_obj, commit_hash) pairs for Phase A & C
-    file_commit_pairs = [
-        (f, c.get("commit_hash_ref", ""))
-        for c in commits for f in c.get("files", [])
-    ]
-
-    # Phase C: split large diffs first (before summarization)
-    logger.info(f"Phase C: Atomic Diff Splitting on {len(file_commit_pairs)} files...")
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        list(ex.map(lambda p: split_large_diffs(p[0]), file_commit_pairs))
-
-    # Phase A: per-diff context summarization
-    logger.info(f"Phase A: Context Summarization on {len(file_commit_pairs)} files...")
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        list(ex.map(lambda p: enrich_file_diffs_with_context(p[0], p[1]), file_commit_pairs))
-
-    save_cache()
-    return {"commits": commits}
 
 def node_json_exporter(state: AgentState):
     logger.info("--- NODE 6: JSON Exporter ---")
@@ -1133,7 +968,6 @@ def node_json_exporter(state: AgentState):
         for file_obj in commit.get("files", []):
             valid_diffs = [
                 d for d in file_obj.get("file_diffs", [])
-                if d.get("context_summarization", "") not in _NO_CONTEXT_STRINGS
             ]
             pruned_diff_count += len(file_obj.get("file_diffs", [])) - len(valid_diffs)
             if valid_diffs:
@@ -1186,8 +1020,7 @@ workflow.add_edge(START, "context_manager")
 workflow.add_edge("context_manager", "solution_mapper")
 workflow.add_edge("solution_mapper", "commit_filter")
 workflow.add_edge("commit_filter", "roslyn_processor")
-workflow.add_edge("roslyn_processor", "llm_chunker")
-workflow.add_edge("llm_chunker", "json_exporter")
+workflow.add_edge("roslyn_processor", "json_exporter")
 workflow.add_edge("json_exporter", END)
 
 app = workflow.compile()
