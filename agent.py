@@ -719,7 +719,7 @@ class XmlPreprocessor:
         processed_paths = set()
 
         for t_node in targets:
-            path = root.getpath(t_node)
+            path = etree.ElementTree(root).getpath(t_node)
             if path in processed_paths:
                 continue
             processed_paths.add(path)
