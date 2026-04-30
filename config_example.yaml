@@ -1,0 +1,15 @@
+repo:
+  path: 
+  solution_path: 
+  target_branch: 
+  max_prs: 100
+
+llm:
+  provider: "openai"
+  model_name: "gpt-4o-mini"
+  max_chunk_length: 4000
+  enable_intent_disaggregation: false
+  reset_cache: false
+
+output:
+  file_path: "./output/dataset.json"
