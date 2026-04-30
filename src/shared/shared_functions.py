@@ -87,7 +87,6 @@ def minify_code(text: str) -> str:
     text = re.sub(r'(?m)^[ \t]+', '', text)
     return text.strip()
 
-# Unused but kept as requested
 def disaggregate_commit_intent(commit: Dict) -> None:
     from src.shared.shared_constants import ENABLE_INTENT_DISAGGREGATION
     if not ENABLE_INTENT_DISAGGREGATION:
@@ -115,58 +114,6 @@ def disaggregate_commit_intent(commit: Dict) -> None:
         commit["disaggregated_intents"] = _parse_llm_json(raw, [])
     except Exception as e:
         logger.error(f"Phase B failed for commit: {e}")
-
-def split_large_diffs(file_obj: Dict) -> None:
-    server = get_roslyn_server()
-    expanded = []
-    is_cs = file_obj.get("file_name", "").endswith(".cs")
-    for diff in file_obj.get("file_diffs", []):
-        total_len = len(diff.get("raw_old_code", "")) + len(diff.get("raw_new_code", ""))
-        if total_len > MAX_CHUNK_LENGTH:
-            prompt = (
-                "<Role>Git & Code Review Expert</Role>\n"
-                "<Task>Split the provided large diff into smaller, logically atomic sub-diffs based on independent functional changes.</Task>\n"
-                "<Constraints>\n"
-                "1. Each sub-diff must represent a standalone logical change.\n"
-                "2. Do NOT alter, omit, or hallucinate code content; strictly segment the existing code.\n"
-                '3. Output STRICTLY as a JSON object without markdown wrapping (no ```json). Do not include any preamble, explanations, or conversational text. Your entire response must be valid, parsable JSON: {"sub_diffs": [{"raw_old_code": "...", "raw_new_code": "..."}]}\n'
-                "</Constraints>\n"
-                f"<InputDiff>\nOld Code: {diff.get('raw_old_code','')}\nNew Code: {diff.get('raw_new_code','')}\n</InputDiff>"
-            )
-            try:
-                resp = get_openai_client().chat.completions.create(
-                    model=LLM_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
-                )
-                parsed = _parse_llm_json(resp.choices[0].message.content, {})
-                sub_diffs = parsed.get("sub_diffs", [])
-                if sub_diffs:
-                    for sd in sub_diffs:
-                        raw_old = sd.get("raw_old_code", "")
-                        raw_new = sd.get("raw_new_code", "")
-                        if is_cs:
-                            clean_old = server.clean_code(raw_old) if raw_old else ""
-                            clean_new = server.clean_code(raw_new) if raw_new else ""
-                        else:
-                            clean_old, clean_new = raw_old, raw_new
-                        changed_chars = get_diff_char_count(clean_old, clean_new)
-                        if changed_chars == 0:
-                            continue
-                        chunk_data = {
-                            "raw_old_code":   raw_old,
-                            "clean_old_code": clean_old,
-                            "raw_new_code":   raw_new,
-                            "clean_new_code": clean_new,
-                        }
-                        if changed_chars < 10:
-                            chunk_data["manual_review"] = True
-                        expanded.append(chunk_data)
-                    continue
-            except Exception as e:
-                logger.error(f"Phase C split failed: {e}")
-        expanded.append(diff)
-    file_obj["file_diffs"] = expanded
 
 def _xml_extract_parent_block(xml_text: str, search_text: str) -> str:
     if not search_text or not xml_text:
